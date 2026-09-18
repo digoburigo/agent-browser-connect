@@ -94,8 +94,15 @@ Full agent-facing instructions: [`SKILL.md`](SKILL.md).
 ```bash
 bash tests/run.sh                                  # deterministic, mock agent-browser, node only (~40 s)
 AB_RUN_REAL_CHROME=1 bash tests/real-chrome.sh     # gated; disposable Chrome profile
+AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh    # gated; one tab in YOUR Chrome, gentle
 AB_RUN_USER_CHROME=1 bash tests/stress-user-chrome.sh   # gated; opens N tabs in YOUR Chrome
 ```
+
+`real-chrome-guard.sh` is the safe one: a single session, no concurrency, no tab
+creation, and it releases with plain `cleanup.sh` so your tab survives. It checks what
+the mock suite structurally cannot — that the guard really sits in front of a live CLI,
+that a real daemon accepts the batch form the dispatcher sends, and that the bound tab is
+unchanged after every refusal.
 
 **The stress test can crash the browser it is testing.** At its default 10 tabs x 6
 rounds it segfaulted Chrome 153 during round 6 (2026-09-18), taking every open tab with

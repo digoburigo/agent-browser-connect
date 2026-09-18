@@ -89,6 +89,11 @@ The deterministic suite uses a mock daemon and high-concurrency races:
 bash ~/.claude/skills/agent-browser-connect/tests/run.sh
 ```
 
+It runs three layers: the allow-list policy (`tests/guard.sh`, no daemon), the structured
+`lib.sh` readers (`tests/lib-interfaces.sh`, no daemon), and the mock-daemon integration
+cases. Against a real browser, `AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh`
+probes one session in the user's own Chrome and preserves the tab.
+
 The gated integration suite launches the installed Google Chrome binary with a disposable profile. It never uses the user's profile:
 
 ```bash
