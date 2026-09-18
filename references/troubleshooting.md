@@ -86,7 +86,7 @@ Keep using the existing Chrome rather than launching a substitute.
 The deterministic suite uses a mock daemon and high-concurrency races:
 
 ```bash
-bash ~/.claude/skills/agent-browser-connect/tests/run.sh
+bash tests/run.sh
 ```
 
 It runs three layers: the allow-list policy (`tests/guard.sh`, no daemon), the structured
@@ -94,11 +94,11 @@ It runs three layers: the allow-list policy (`tests/guard.sh`, no daemon), the s
 cases. Against a real browser, `AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh`
 probes one session in the user's own Chrome and preserves the tab.
 
-The gated integration suite launches the installed Google Chrome binary with a disposable profile. It never uses the user's profile:
+Run these from the skill directory. The gated integration suite launches the installed Google Chrome binary with a disposable profile. It never uses the user's profile:
 
 ```bash
-AB_RUN_REAL_CHROME=1 bash ~/.claude/skills/agent-browser-connect/tests/real-chrome.sh
-AB_RUN_REAL_CHROME=1 AB_REAL_CHROME_HEADLESS=0 bash ~/.claude/skills/agent-browser-connect/tests/real-chrome.sh  # visible disposable window
+AB_RUN_REAL_CHROME=1 bash tests/real-chrome.sh
+AB_RUN_REAL_CHROME=1 AB_REAL_CHROME_HEADLESS=0 bash tests/real-chrome.sh  # visible disposable window
 ```
 
 ## Stale daemons

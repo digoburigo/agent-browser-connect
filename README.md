@@ -55,24 +55,32 @@ git clone https://github.com/digoburigo/agent-browser-connect ~/.agents/skills/a
 ln -s ~/.agents/skills/agent-browser-connect ~/.claude/skills/agent-browser-connect
 ```
 
-The scripts resolve their own location, so any install path works. The paths written in
-`SKILL.md` assume `~/.claude/skills/agent-browser-connect`; if you install elsewhere, the
-agent substitutes the directory it found the skill in.
+The scripts resolve their own location, so any install path works. `SKILL.md` does not
+hardcode an install path either: it tells the agent to start `connect.sh` from the
+directory its harness loaded the skill from, and `connect.sh` then prints absolute paths
+for everything that follows, so the directory is needed exactly once.
+
+If you run several agents against one clone, symlinking (above) is what keeps them in
+sync. A machine with Claude Code, Codex, opencode and pi installed ends up with the skill
+visible at seven or more paths; one real clone plus symlinks means one `git pull` updates
+all of them.
 
 ## Usage
 
 The agent invokes it; you normally do not. In short:
 
 ```bash
-# 1. Connect — opens one pinned tab and prints a wrapper path + session name
+# 1. Connect — opens one pinned tab and prints a wrapper path + session name.
+#    Substitute wherever you installed the skill; this example assumes Claude Code.
 bash ~/.claude/skills/agent-browser-connect/scripts/connect.sh myapp --url http://localhost:3000
 
 # 2. Every browser command goes through the printed wrapper
 bash <wrapper> snapshot -i
 bash <wrapper> click @e3
 
-# 3. Release the session (keeps the tab, clears network routes, stops the daemon)
-bash ~/.claude/skills/agent-browser-connect/scripts/cleanup.sh <session>
+# 3. Release the session (keeps the tab, clears network routes, stops the daemon).
+#    connect.sh prints this line with the path already filled in.
+bash <skill-dir>/scripts/cleanup.sh <session>
 ```
 
 Add `--react` to `connect.sh` when the task needs React introspection — the DevTools hook

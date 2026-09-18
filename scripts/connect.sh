@@ -63,15 +63,16 @@ case "$URL" in
   -*) die_usage "URL values may not begin with '-'" ;;
 esac
 
-# O hook do React DevTools é um init script registrado UMA vez, quando o daemon
-# se conecta — não a cada navegação. Exportando aqui, os comandos `react …`
-# valem para a sessão inteira e o modo de aprovação do Chrome pergunta uma vez
-# só. Passar `--enable react-devtools` num `open` posterior re-registra o hook e
-# força o daemon a discar um WebSocket novo (flags de launch diferentes da
-# chamada anterior): como o wrapper cerca o comando com `tab list`, são duas
-# reconexões — duas aprovações a mais para o usuário — em cada página perfilada.
-# Até a 0.37.1 cada um desses sockets ainda ficava pendurado; a 0.38 fecha o
-# antigo (upstream #1739), então o custo hoje é o diálogo, não o vazamento.
+# The React DevTools hook is an init script registered ONCE, when the daemon
+# connects — not on every navigation. Exporting it here makes the `react …`
+# commands work for the whole session at the cost of a single Chrome approval.
+# Passing `--enable react-devtools` to a later `open` re-registers the hook and
+# forces the daemon to dial a new WebSocket (its launch-affecting flags differ
+# from the previous invocation's): since the wrapper brackets the command with
+# `tab list`, that is two reconnects — two extra approval dialogs for the user —
+# on every page profiled that way. Through 0.37.1 each of those sockets also
+# stayed established; 0.38 closes the old one (upstream #1739), so the cost
+# today is the dialog, not the leak.
 if [ "$REACT_HOOK" -eq 1 ]; then
   export AGENT_BROWSER_ENABLE="react-devtools"
 fi
@@ -223,14 +224,14 @@ SESSION_WAS_ACTIVE="$AB_SESSION_ACTIVE"
 SOCKET_DIR="$AB_SESSION_SOCKET_DIR"
 [ -n "$SOCKET_DIR" ] || SOCKET_DIR="$(ab_default_socket_dir)"
 
-# Um upgrade do agent-browser deixa o daemon da sessão anterior numa versão
-# antiga. O primeiro comando de BROWSER que chegar nele imprime "Daemon version
-# mismatch detected, restarting..." e reinicia o daemon — e um daemon reiniciado
-# perde a conexão CDP externa: sem os flags de conexão ele LANÇA um Chrome
-# próprio no lugar do Chrome do usuário (medido em 16/09/2026, 0.37.1 → 0.38.0).
-# `session info` não reinicia nada e já reporta a versão do daemon, então a
-# troca é feita aqui, deliberadamente, em vez de virar um relançamento no meio
-# de um comando.
+# Upgrading agent-browser leaves the previous session's daemon on the old
+# version. The first BROWSER command to reach it prints "Daemon version mismatch
+# detected, restarting..." and restarts the daemon — and a restarted daemon loses
+# its external CDP attachment: without the connection flags it LAUNCHES a Chrome
+# of its own instead of using the user's (measured 2026-09-16, 0.37.1 → 0.38.0).
+# `session info` restarts nothing and already reports the daemon's version, so
+# the swap happens here, deliberately, rather than becoming a relaunch in the
+# middle of some other command.
 DAEMON_VERSION="$AB_SESSION_VERSION"
 CLI_VERSION="$(ab_cli_version "$AGENT_BROWSER_BIN" 2>/dev/null || true)"
 if [ "$SESSION_WAS_ACTIVE" = "1" ] && [ -n "$DAEMON_VERSION" ] && [ -n "$CLI_VERSION" ] \
@@ -242,9 +243,9 @@ if [ "$SESSION_WAS_ACTIVE" = "1" ] && [ -n "$DAEMON_VERSION" ] && [ -n "$CLI_VER
   browser command hit it instead would restart it and could launch a substitute
   Chrome. Chrome may ask to approve this one new connection.
 MSG
-  # Só o daemon é parado. Os sidecars de sessão (`<session>.target`) ficam de
-  # propósito: é por eles que o daemon novo volta ao MESMO target em vez de
-  # abrir mais uma aba na janela do usuário.
+  # Only the daemon is stopped. The session sidecars (`<session>.target`) are
+  # left in place on purpose: they are what lets the replacement daemon rebind to
+  # the SAME target instead of opening another tab in the user's window.
   "$AGENT_BROWSER_BIN" --session "$SESSION" close >/dev/null 2>&1 || true
   SESSION_WAS_ACTIVE=0
   STALE_DAEMON_SWAPPED=1
@@ -368,11 +369,11 @@ elif [ "${STALE_DAEMON_SWAPPED:-0}" -eq 1 ] \
   && ! grep -q 'tab_gone' "$DIR/attach.err" 2>/dev/null \
   && sleep 2 \
   && BOUND="$(browser_command get url 2>"$DIR/attach.err")"; then
-  # Uma tentativa a mais existe SÓ aqui. Em toda outra situação o script anexa
-  # uma vez e não insiste (um diálogo repetido é sinal de que outro processo
-  # está reconectando). Mas neste caminho fomos nós que paramos um daemon que
-  # estava funcionando, e o primeiro comando de um daemon recém-subido costuma
-  # estourar timeout; falhar aqui deixaria o usuário sem sessão nenhuma.
+  # One extra attempt exists ONLY here. Everywhere else the script attaches once
+  # and does not insist (a repeated dialog is a sign that another process is
+  # reconnecting). But on this path we are the ones who stopped a daemon that was
+  # working, and a freshly started daemon's first command often times out;
+  # failing here would leave the user with no session at all.
   ATTACH_ESTABLISHED=1
   TARGET_DISCOVERY_SAFE=1
   echo "! The first command after the version swap timed out; the single retry succeeded." >&2
@@ -468,11 +469,12 @@ if [ -n "$PREV_OWNED_TARGET_ID" ]; then
         else
           echo "! Browser binding had drifted to another tab; switched back to the owned target before continuing (this brought it to the front of Chrome)." >&2
         fi
-        # Trocar um daemon obsoleto custa um attach novo, e todo attach novo
-        # abre uma aba. Quando o target da sessão sobreviveu, essa aba é nossa e
-        # está vazia — fechá-la deixa o upgrade invisível na janela do usuário.
-        # Três condições provam a posse: a troca aconteceu nesta execução, a aba
-        # é a que este attach vinculou, e ela nunca saiu de about:blank.
+        # Swapping a stale daemon costs a fresh attach, and every fresh attach
+        # opens a tab. When the session's own target survived, that new tab is
+        # ours and empty — closing it makes the upgrade invisible in the user's
+        # window. Three conditions prove ownership: the swap happened in this
+        # run, the tab is the one this attach bound to, and it never left
+        # about:blank.
         if [ "${STALE_DAEMON_SWAPPED:-0}" -eq 1 ] \
           && [ -n "$PREV_ACTIVE" ] \
           && [ "$ATTACH_BOUND_URL" = "about:blank" ]; then
@@ -528,10 +530,10 @@ fi
 
 REACT_STATUS=""
 if [ "$REACT_HOOK" -eq 1 ]; then
-  # A checagem é de capacidade, não de presença: `typeof
-  # window.__REACT_DEVTOOLS_GLOBAL_HOOK__` dá "object" em qualquer página que
-  # já tenha react-scan ou a extensão do React DevTools, então só o `react
-  # tree` do próprio agent-browser distingue o hook dele de um homônimo.
+  # This is a capability check, not a presence check: `typeof
+  # window.__REACT_DEVTOOLS_GLOBAL_HOOK__` is "object" on any page that already
+  # has react-scan or the React DevTools extension, so only agent-browser's own
+  # `react tree` can tell its hook apart from a namesake.
   if [ -z "$URL" ]; then
     REACT_STATUS="pending"
   else

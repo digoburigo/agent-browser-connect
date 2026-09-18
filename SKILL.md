@@ -13,13 +13,26 @@ their Chrome alone.
 ## 1. Connect
 
 ```bash
-bash ~/.claude/skills/agent-browser-connect/scripts/connect.sh <label> --url <url>
+bash <skill-dir>/scripts/connect.sh <label> --url <url>
 ```
 
-Paths here assume the skill lives in `~/.claude/skills/agent-browser-connect`. If it was
-installed somewhere else (`~/.agents/skills/`, a plugin directory, a clone in a repo),
-substitute that directory in every command below — the scripts resolve their own location,
-so any install path works.
+`<skill-dir>` is the directory this file was loaded from, and your harness named it when
+it loaded this file — use that, verbatim. **Do not assume `~/.claude/skills/`.** The same
+skill is routinely installed at `~/.agents/skills/` (Codex, opencode, pi), under a profile
+directory like `~/.claude-profiles/<name>/skills/`, inside `~/.config/opencode/skills/`,
+project-local in `.claude/skills/`, or as a plain clone anywhere. The scripts resolve their
+own location, so every one of those works — but only if you start them by the right path.
+
+If you genuinely do not know the directory, resolve it inside the command itself. It has
+to be one command, because shell variables do not survive between tool calls:
+
+```bash
+bash "$(ls -d ~/.*/skills/agent-browser-connect ~/.*/*/skills/agent-browser-connect \
+  ./.claude/skills/agent-browser-connect 2>/dev/null | head -1)/scripts/connect.sh" <label> --url <url>
+```
+
+You need the skill directory for this one command and never again: connect.sh prints the
+absolute wrapper path and the exact cleanup line, and everything below uses those.
 
 `<label>` is display text (defaults to the repo name). `--url` is optional. Add
 `--react` when the task needs React introspection (see below), and `--slot <name>`
@@ -78,7 +91,7 @@ React introspection needs the DevTools hook, and that hook is an init script
 registered **once per session**, not per page. Ask for it when you connect:
 
 ```bash
-bash ~/.claude/skills/agent-browser-connect/scripts/connect.sh <label> --react --url <url>
+bash <skill-dir>/scripts/connect.sh <label> --react --url <url>
 ```
 
 Then `react tree`, `react inspect <id>` and `react renders start|stop` work through the
@@ -93,8 +106,9 @@ mode asks the user to approve each one. The wrapper brackets your command with
 `tab list`, so one hooked `open` alternates flags twice: two dialogs per profiled page.
 (Through 0.37.1 each of those sockets also stayed established forever — six pages left
 11 open. 0.38 closes them, so the cost is now dialogs and a reconnect, not a leak.)
-If you only discover mid-task that you need React, run `cleanup.sh <session>` and connect
-again with `--react`; the hook cannot be installed into a live daemon.
+If you only discover mid-task that you need React, run the cleanup line connect.sh
+printed and connect again with `--react`; the hook cannot be installed into a live
+daemon.
 
 **After agent-browser is upgraded, connect again before anything else.** The daemon
 holding a live session keeps running the old version, and the first browser command
@@ -106,8 +120,11 @@ same tab. Just re-run step 1 when you see either message.
 ## 3. Clean up
 
 ```bash
-bash ~/.claude/skills/agent-browser-connect/scripts/cleanup.sh <session>
+bash <skill-dir>/scripts/cleanup.sh <session>
 ```
+
+connect.sh printed this exact line with the path already filled in — prefer copying that
+over rebuilding it.
 
 Done when it prints the release line and exits 0. Cleanup preserves the Chrome tab,
 clears network routes, stops the background daemon, and removes session state. Use
