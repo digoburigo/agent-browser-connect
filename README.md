@@ -94,8 +94,14 @@ Full agent-facing instructions: [`SKILL.md`](SKILL.md).
 ```bash
 bash tests/run.sh                                  # deterministic, mock agent-browser, node only (~40 s)
 AB_RUN_REAL_CHROME=1 bash tests/real-chrome.sh     # gated; disposable Chrome profile
-AB_RUN_REAL_CHROME=1 bash tests/stress-user-chrome.sh
+AB_RUN_USER_CHROME=1 bash tests/stress-user-chrome.sh   # gated; opens N tabs in YOUR Chrome
 ```
+
+**The stress test can crash the browser it is testing.** At its default 10 tabs x 6
+rounds it segfaulted Chrome 153 during round 6 (2026-09-18), taking every open tab with
+it. Chrome relaunched itself and the helper released all ten sessions cleanly, but do not
+point this at a browser you are relying on — pass a smaller count
+(`... stress-user-chrome.sh 3 3`) or run it against a Chrome you are happy to lose.
 
 `tests/run.sh` runs in CI on every push.
 

@@ -55,12 +55,14 @@ Keep using the existing Chrome rather than launching a substitute.
 | Wrapper reports corrected drift | The persisted binding changed while the owned target still existed | The dispatcher restores the target before running the requested command. Continue through the same wrapper and stop using any bare browser command. |
 | Commands reach the wrong page | A bare agent-browser command bypassed the guard | Return to the wrapper. `tab list` is the only public tab-management operation it permits. |
 | Chrome keeps switching between two agents' tabs | Something brought a tab to the front: a fresh connect (new tabs open in the foreground), a `tab_gone` recovery, a drift restore (`tab <id>` always sends `Page.bringToFront`), or a bare `bringtofront` | Read `events.log` in each agent's wrapper directory (the path `connect.sh` printed, minus `/ab`). Zero `drift-restored` lines means the wrapper is not the cause; look for bare `agent-browser` calls or repeated reconnects. `cleanup.sh` prints the same counts and archives the log under `<wrapper root>/.history/`. |
-| A second Chrome window appeared and stayed after the task | `record start` ran on the session (through a wrapper older than 2026-09-04, or bare). It creates a new browser context, which Chrome shows as its own window, and `record stop` does not close it | Close that window by hand. The wrapper now rejects `record`; use `screenshot` or `screencast` instead. A fresh attach can also land in a new window when Chrome has no normal window open for the default profile; that one is Chrome's placement rule, not the skill |
+| A second Chrome window appeared and stayed after the task | `record start` ran on the session (through a wrapper older than 2026-09-04, or bare). It creates a new browser context, which Chrome shows as its own window, and `record stop` does not close it | Close that window by hand. The wrapper now rejects `record`; use `screenshot` for stills, or `trace start|stop` / `profiler start|stop` to capture what happened. A fresh attach can also land in a new window when Chrome has no normal window open for the default profile; that one is Chrome's placement rule, not the skill |
 | `Ref not found: @eN` | The page changed after a snapshot | Run `bash <wrapper> snapshot -i` again and use fresh refs. |
 | Chrome restarted | The exact browser WebSocket changed | Re-run connect for the same owner/slot or explicit session. |
 | `agent-browser was upgraded (X → Y)` from the wrapper, exit 8 | A live session is still held by a daemon running the previous version | Re-run `connect.sh`. It stops the stale daemon and attaches once with the current version, keeping the same tab. Never work around it by calling `agent-browser` directly: the restart that a browser command triggers drops the CDP attachment and can launch a substitute Chrome (reproduced 2026-09-16, 0.37.1 → 0.38.0, `⚠ Daemon version mismatch detected, restarting...` followed by `[agent-browser] launched browser` and a full Chrome for Testing process tree). |
 | Unexpected behavior after an upgrade | Daemon or socket state may be stale | Re-run `connect.sh` for each session you own, then `agent-browser doctor`; add `--fix` only when it recommends doing so. |
 | Every new session times out while the port remains open | Too many browser-attached daemons may be active | Inspect and close only sessions proven stale. |
+| `Connection refused (os error 61)` from connect, exit 4 | Chrome quit, crashed, or had remote debugging switched off between the port check and the attach; or it restarted and the resolved endpoint is stale | **Not an approval dialog — do not wait for one.** Connect re-probes the port and says which case it is. If the port is still open, re-run the same connect to resolve the current endpoint. If it is closed, ask the user to confirm Chrome is running with remote debugging on, then re-run. |
+| Chrome died during a stress run | `tests/stress-user-chrome.sh` at a high tab count can segfault the browser (recorded 2026-09-18, Chrome 153, `CrBrowserMain`) | Expected hazard of that script, not of ordinary use. Sessions still release cleanly; verify with `agent-browser session list`. Re-run with fewer tabs, or against a browser you can afford to lose. |
 | `Can't assign requested address (os error 49)` | The machine is out of ephemeral ports | Identify the leaking process and tell the user; do not kill it without permission. |
 
 ## Exit statuses
@@ -68,7 +70,7 @@ Keep using the existing Chrome rather than launching a substitute.
 | Status | Meaning | Next step |
 |---|---|---|
 | `0` | Operation completed with exact ownership intact | Continue through the wrapper, or report cleanup success. |
-| `2` | Invalid or ownership-changing command | Correct the arguments; do not bypass the wrapper. |
+| `2` | A command the guard deliberately forbids | The message names the reason and the sanctioned alternative. Use it; do not bypass the wrapper. Distinct from `10`, which means the command is merely unlisted. |
 | `3` | A required executable is unavailable | Restore `agent-browser` or Node on `PATH`. |
 | `4` | Chrome is not listening or its endpoint cannot be resolved | Enable remote debugging and re-run connect. |
 | `5` | Session state, locking, diagnostics, or shutdown could not be validated | Preserve artifacts and follow the emitted recovery instruction. |
@@ -76,6 +78,7 @@ Keep using the existing Chrome rather than launching a substitute.
 | `7` | The daemon stopped, but unsafe socket artifacts were preserved | Inspect the reported private socket directory manually. |
 | `8` | The owned target/session is inactive or gone | Re-run connect for the same owner and slot. |
 | `9` | A command ran but post-command target ownership drifted | The guard restored the owned target when possible; inspect the command's effects before continuing. Pre-command drift is restored silently and the command proceeds (exit follows the command). |
+| `10` | The command is not in the wrapper's allow-list | Not a forbidden command — one the guard does not know. Do not retry it bare through `agent-browser`. Report to the user that this command is not in the allow-list; adding it is a one-line change to `scripts/guard.sh`. |
 | `130`/`143` | Operation was interrupted | Re-run connect or cleanup for the same identity to inspect state safely. |
 
 ## Validation

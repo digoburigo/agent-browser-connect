@@ -52,6 +52,15 @@ you. The loop: `open`, `snapshot -i`, act on `@eN` refs, re-snapshot after anyth
 changes the page. If a wrapped command exits with a message telling you to re-run
 connect, run step 1 again with any label; the session name stays the same.
 
+The wrapper permits a fixed list of agent-browser commands and refuses everything else,
+so a command can be refused for either of two reasons and they need different responses.
+Exit 2 means it is forbidden on purpose: the message names why and what to use instead,
+so take that alternative. **Exit 10 means the command is simply not on the list** — often
+something agent-browser added after this skill was last updated. Never route around
+either one with a bare `agent-browser` call; that is what breaks the user's tabs. Tell
+them the command is not in the allow-list, and that adding it is a one-line change to
+`scripts/guard.sh`.
+
 Two flags keep a long loop cheap (agent-browser 0.38+):
 
 ```bash

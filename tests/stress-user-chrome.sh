@@ -4,6 +4,17 @@
 # simulated tab closure. Verifies per-tab isolation and full cleanup.
 #
 # Gated: AB_RUN_USER_CHROME=1 bash tests/stress-user-chrome.sh [tabs] [rounds]
+#
+# THIS CAN CRASH THE BROWSER IT IS TESTING. Observed 2026-09-18 at the default
+# 10 tabs x 6 rounds against Chrome 153.0.8010.48: the browser process segfaulted
+# during round 6 while several sessions were attaching, closing and reconnecting
+# targets at once (EXC_BAD_ACCESS / KERN_INVALID_ADDRESS at 0x140, faulting thread
+# CrBrowserMain). Chrome relaunched on its own and the helper's cleanup released
+# all ten sessions with nothing left behind, but every tab open at that moment
+# went with it. That looks like a browser bug rather than a helper defect — a
+# browser should not segfault from CDP traffic — but this script is what provokes
+# it, so do not run it against a Chrome the user is relying on. Lower the tab
+# count for a gentler run; 3 tabs x 3 rounds still exercises isolation.
 set -euo pipefail
 
 if [ "${AB_RUN_USER_CHROME:-0}" != "1" ]; then
@@ -18,6 +29,12 @@ TABS="${1:-10}"
 ROUNDS="${2:-6}"
 STRESS_ID="${AB_CONNECT_ID:-stress-user-chrome-$$}"
 export AB_CONNECT_ID="$STRESS_ID"
+
+cat >&2 <<'WARN'
+! This drives the user's real Chrome hard enough to have crashed it before.
+!   Every tab currently open in that browser is at risk. Ctrl-C now if the user
+!   is relying on it; see the header of this script for the recorded crash.
+WARN
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ab-stress.XXXXXX")"
 PORT_FILE="$WORK/server.port"

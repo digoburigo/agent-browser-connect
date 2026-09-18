@@ -1,0 +1,165 @@
+# Allow-list policy cases for scripts/guard.sh.
+# Format: <expected exit><TAB>word<TAB>word...   (tab-delimited so arguments may contain spaces)
+#   0 = allowed  ·  2 = deliberately forbidden  ·  10 = not in the allow-list
+# A "B" prefix on the expected code runs the case with batch nesting disallowed.
+
+## the documented loop
+0	snapshot	-i
+0	snapshot	--delta
+0	snapshot	--full
+0	snapshot	-i	-c	-d	3	-s	#main
+0	get	url
+0	get	text	#heading
+0	get	title
+0	click	@e3
+0	click	@e3	--human
+0	fill	@e2	hello world
+0	type	@e2	hello world
+0	open	http://example.test/
+0	back
+0	forward
+0	reload
+0	screenshot	/tmp/x.png
+0	screenshot	--if-changed	/tmp/x.png	--threshold	0.1
+0	wait	#ready	--timeout	500
+0	press	Enter
+0	press	Control+a
+0	eval	window.location.href
+0	batch	get url
+0	batch	--bail	get url
+0	tab	list
+0	tab	list	--json
+
+## page-local verbs the core skill relies on
+0	frame	main
+0	frame	#embed
+0	dialog	accept
+0	dialog	accept	my input
+0	dialog	dismiss
+0	dialog	status
+0	keyboard	type	hello
+0	mouse	move	10	20	--human
+0	scroll	down	--selector	#list
+0	find	role	button	click
+0	find	text	Save	click	--exact
+0	is	visible	#x
+0	highlight	#x
+0	console	--clear
+0	errors
+0	diff	snapshot	-b	/tmp/base
+0	pdf	/tmp/out.pdf
+0	pushstate	/next
+0	vitals
+0	a11y	--tags	wcag2a
+0	read	http://example.test/	--outline
+
+## React, permitted through the session hook connect.sh --react installs
+0	react	tree
+0	react	inspect	12
+0	react	renders	start
+0	react	renders	stop	--json
+0	react	suspense	--only-dynamic
+
+## network, storage, emulation
+0	network	route	http://x/	--abort
+0	network	unroute
+0	network	requests	--filter	api
+0	network	har	start	/tmp/h.har
+0	cookies	get
+0	cookies	set	--curl	/tmp/cookies.txt
+0	storage	local
+0	set	viewport	1280	800
+0	set	media	dark
+0	trace	start
+0	profiler	stop	/tmp/p.cpuprofile
+0	skills	get	core
+
+## target creation, switching, closing
+2	tab	new	http://forbidden.test
+2	tab	close	t2
+2	tab	TARGET-FOREIGN
+2	tab	list	new	http://forbidden.test
+2	click	@e1	--new-tab
+2	click	@e1	--new-tab=true
+2	window	new
+2	bringtofront
+2	inspect
+
+## a second Chrome window, or a session that is not ours
+2	record	start	/tmp/demo.webm
+2	record	restart	/tmp/demo.webm	http://example.test
+2	record	stop
+2	connect	9222
+2	close
+2	get	url	--session	foreign
+2	get	url	--cdp	ws://127.0.0.1:9222/devtools/browser
+2	snapshot	--namespace	other
+2	get	url	--config	/tmp/c.json
+
+## launch-affecting flags: each one costs the user another approval dialog
+2	--enable	react-devtools	open	http://example.test
+2	open	http://example.test	--enable=react-devtools
+2	--input-mode	human	click	@e1
+2	open	http://x/	--proxy	http://evil.test
+2	open	http://x/	--extension	/tmp/ext
+2	open	http://x/	--init-script	/tmp/s.js
+2	open	http://x/	--args	--no-sandbox
+2	open	http://x/	--user-agent	Mozilla
+2	open	http://x/	--executable-path	/tmp/chrome
+2	open	http://x/	--profile	Default
+2	open	http://x/	--restore-check-fn	fetch('http://evil.test')
+2	snapshot	--allow-file-access
+2	snapshot	--ignore-https-errors
+2	snapshot	--idle-timeout	0
+2	snapshot	--confirm-actions	none
+
+## key chords that create, restore, close or replace a target
+2	press	Meta+t
+2	press	Control+w
+2	press	Meta+T
+2	press	--json	Meta+t
+2	press	Meta+t	--json
+2	press	alt+f4
+
+## commands outside the containment boundary
+2	plugin	add	npm:whatever
+2	plugin	run	x	command.run
+2	upgrade
+2	install
+2	doctor	--fix
+2	stream	enable	--port	9999
+2	removeinitscript	3
+2	clipboard	read
+2	webmcp	invoke	tool	--params	@/etc/passwd
+2	auth	login	prod
+2	auth	save	prod
+2	state	save	/tmp/state.json
+2	session	id
+2	confirm	3
+2	deny	3
+2	mcp
+2	chat	do the thing
+2	dashboard	start
+
+## split chords, filesystem crossings, network identity
+2	keydown	Meta
+2	keyup	Meta
+2	upload	#file	/etc/passwd
+2	download	#a	/tmp/out
+2	set	headers	{}
+2	set	credentials	user	pass
+2	diff	url	http://a.test	http://b.test
+
+## leading global options cannot hide the action behind them
+2	--json	tab	new	http://forbidden.test
+2	--quiet	snapshot
+2	--
+
+## not forbidden, simply not in the allow-list
+10	totallynewverb
+10	react	eval	window.x
+10	snapshot	--brand-new-flag
+10	get	somethingnew
+
+## nested batch would carry a whole unguarded program
+B2	batch	get url

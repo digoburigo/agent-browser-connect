@@ -5,6 +5,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "$SCRIPT_DIR/lib.sh"
+# shellcheck source=guard.sh
+. "$SCRIPT_DIR/guard.sh"
 
 META="${1:-}"
 AGENT_BROWSER_BIN="${2:-}"
@@ -94,81 +96,10 @@ if [ -z "$OWNED_TARGET_ID" ] || [[ ! "$OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; 
   exit 8
 fi
 
-# Reject anything that can change browser ownership or create another target.
-# Applied to the top-level command and to every line inside a batch.
-guard_words() {
-  local allow_batch="$1"
-  shift
-  local argument action key_chord
-  for argument in "$@"; do
-    case "$argument" in
-      --session|--session=*|--namespace|--namespace=*|--cdp|--cdp=*|--auto-connect|--auto-connect=*|--pin-tab|--pin-tab=*|--no-pin-tab|--no-pin-tab=*|--provider|--provider=*|-p|--engine|--engine=*|--executable-path|--executable-path=*|--profile|--profile=*|--state|--state=*|--restore|--restore=*|--session-name|--session-name=*|--config|--config=*|--allowed-domains|--allowed-domains=*|--new-tab|--new-tab=*)
-        echo "✗ '$argument' is blocked because it can change browser ownership or create another target; use connect.sh and the existing pinned target instead." >&2
-        return 2
-        ;;
-      --enable|--enable=*|--input-mode|--input-mode=*)
-        # Não mudam a posse, mas são flags de launch: quando diferem da chamada
-        # anterior o daemon disca um WebSocket novo, e o modo de aprovação do
-        # Chrome pergunta outra vez. O hook do React entra no attach
-        # (`connect.sh --react`) e o ponteiro humano tem `--human` por ação.
-        echo "✗ '$argument' is blocked because a launch-affecting flag makes the daemon open another WebSocket to Chrome, which costs the user one more approval dialog. Use connect.sh --react for the React hook, or --human on the individual click/drag." >&2
-        return 2
-        ;;
-    esac
-  done
-
-  action="${1:-}"
-  if [ -z "$action" ] || [[ "$action" = -* ]]; then
-    echo "✗ Put a browser action first; leading global options are blocked because they can hide ownership-changing commands." >&2
-    return 2
-  fi
-  case "$action" in
-    tab)
-      for argument in "${@:2}"; do
-        case "$argument" in
-          list|--json) ;;
-          *)
-            echo "✗ Direct tab creation, switching, and closing are blocked. Re-run connect.sh after tab_gone." >&2
-            return 2
-            ;;
-        esac
-      done
-      ;;
-    batch)
-      [ "$allow_batch" = "1" ] || {
-        echo "✗ Nested 'batch' is blocked by the pinned-target wrapper." >&2
-        return 2
-      }
-      ;;
-    window|connect|close|chat|mcp|dashboard|inspect)
-      echo "✗ '$action' is blocked by the pinned-target wrapper because it can escape or replace the owned browser session." >&2
-      return 2
-      ;;
-    bringtofront)
-      echo "✗ 'bringtofront' is blocked: it steals Chrome's visible tab from the user and from other agents sharing this browser." >&2
-      return 2
-      ;;
-    record)
-      # 'record start' creates a fresh browser context (Target.createBrowserContext),
-      # which Chrome shows as a separate window, rebinds the session to that page,
-      # and 'record stop' never disposes it. Use 'screenshot' or 'screencast'.
-      echo "✗ 'record' is blocked by the pinned-target wrapper: it opens a new Chrome window in a separate browser context and rebinds the session to it." >&2
-      return 2
-      ;;
-    press)
-      key_chord="$(printf '%s' "${2:-}" | LC_ALL=C tr 'A-Z' 'a-z')"
-      case "$key_chord" in
-        control+t|control+shift+t|meta+t|meta+shift+t|control+n|control+shift+n|meta+n|meta+shift+n|control+w|control+shift+w|meta+w|meta+shift+w|meta+q|alt+f4|alt+enter|option+enter)
-          echo "✗ '$key_chord' is blocked because it can create, restore, close, or replace a Chrome target." >&2
-          return 2
-          ;;
-      esac
-      ;;
-  esac
-  return 0
-}
-
-guard_words 1 "$@" || exit 2
+# Every command is checked against the allow-list in guard.sh before the daemon
+# is touched at all. Applied to the top-level command and to every line inside a
+# batch; exit 2 means deliberately forbidden, exit 10 means not in the allow-list.
+ab_guard_command 1 "$@" || exit $?
 
 # A batch is forwarded only after every line inside it passes the same guard.
 # Argument mode: each quoted argument is one command string. Stdin mode: a JSON
@@ -185,8 +116,15 @@ if [ "${1:-}" = "batch" ]; then
       echo "✗ batch argument was rejected: $BATCH_LINE" >&2
       exit 2
     fi
+    if [ -z "$BATCH_LINE" ]; then
+      # Expanding an empty array under `set -u` is a hard error on bash 3.2, the
+      # bash `#!/usr/bin/env bash` resolves to on stock macOS, so this is caught
+      # here rather than crashing the dispatcher with `unbound variable`.
+      echo "✗ An empty batch argument is blocked: it is not a command." >&2
+      exit 2
+    fi
     IFS=$'\x1f' read -ra BATCH_WORDS <<< "$BATCH_LINE"
-    guard_words 0 "${BATCH_WORDS[@]}" || exit 2
+    ab_guard_command 0 "${BATCH_WORDS[@]}" || exit $?
   done
   if [ "$BATCH_HAS_COMMANDS" -eq 0 ]; then
     if [ -t 0 ]; then
@@ -201,7 +139,7 @@ if [ "${1:-}" = "batch" ]; then
     while IFS= read -r BATCH_LINE; do
       [ -n "$BATCH_LINE" ] || continue
       IFS=$'\x1f' read -ra BATCH_WORDS <<< "$BATCH_LINE"
-      guard_words 0 "${BATCH_WORDS[@]}" || exit 2
+      ab_guard_command 0 "${BATCH_WORDS[@]}" || exit $?
     done <<< "$BATCH_LINES"
   fi
 fi

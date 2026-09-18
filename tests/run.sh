@@ -18,6 +18,10 @@ cleanup_suite() {
 }
 trap cleanup_suite EXIT INT TERM
 
+# The allow-list policy is a pure function and is tested without a daemon; run it
+# first so a policy regression fails before any of the slow mock cases start.
+bash "$SKILL_DIR/tests/guard.sh"
+
 fail() {
   printf 'not ok - %s\n' "$1" >&2
   exit 1
@@ -381,6 +385,25 @@ run_wrapper() {
     "$wrapper" "$@"
 }
 
+# Like assert_wrapper_rejected, but for a denial that is not exit 2: a verb the
+# allow-list simply does not know exits 10 so the agent can tell "this is
+# forbidden" apart from "this is not listed yet".
+assert_wrapper_status() {
+  local wrapper="$1"
+  local expected="$2"
+  shift 2
+  local calls_before calls_after output status
+  calls_before="$(wc -l < "$CASE_LOG" | tr -d ' ')"
+  set +e
+  output="$(run_wrapper success "$wrapper" "$@" 2>&1)"
+  status=$?
+  set -e
+  assert_eq "$status" "$expected"
+  calls_after="$(wc -l < "$CASE_LOG" | tr -d ' ')"
+  assert_eq "$calls_after" "$calls_before"
+  printf '%s' "$output"
+}
+
 assert_wrapper_rejected() {
   local wrapper="$1"
   shift
@@ -443,6 +466,20 @@ assert_wrapper_rejected "$AB" --json tab new http://forbidden.test
 assert_wrapper_rejected "$AB" tab list new http://forbidden.test
 assert_wrapper_rejected "$AB" press Meta+t
 assert_wrapper_rejected "$AB" press Control+w
+assert_wrapper_rejected "$AB" press --json Meta+t
+assert_wrapper_rejected "$AB" plugin add npm:whatever
+assert_wrapper_rejected "$AB" upgrade
+assert_wrapper_rejected "$AB" stream enable --port 9999
+assert_wrapper_rejected "$AB" removeinitscript 3
+assert_wrapper_rejected "$AB" open http://example.test --proxy http://evil.test
+assert_wrapper_rejected "$AB" open http://example.test --extension /tmp/ext
+assert_wrapper_rejected "$AB" keydown Meta
+assert_wrapper_rejected "$AB" batch '' 'get url'
+UNKNOWN_OUTPUT="$(assert_wrapper_status "$AB" 10 totallynewverb)"
+assert_text_contains "$UNKNOWN_OUTPUT" "not in this wrapper allow-list"
+assert_text_contains "$UNKNOWN_OUTPUT" "Report to the user"
+UNKNOWN_OUTPUT="$(assert_wrapper_status "$AB" 10 snapshot --brand-new-flag)"
+assert_text_contains "$UNKNOWN_OUTPUT" "not in this wrapper allow-list"
 BATCH_OUTPUT="$(run_wrapper success "$AB" batch 'get url' 'snapshot -i')"
 assert_eq "$BATCH_OUTPUT" "batched"
 BATCH_OUTPUT="$(printf '[["snapshot","-i"],["fill","@e2","hello world"]]' | run_wrapper success "$AB" batch)"

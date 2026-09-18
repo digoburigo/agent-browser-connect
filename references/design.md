@@ -76,12 +76,52 @@ one, connect refuses rather than inventing a random identity that would leak a t
 5. Reads `tab list` again. If the binding moved, restores it and exits 9. If Chrome's
    page count grew, prints a one-line note and leaves the new page alone.
 
-The guard rejects: tab creation, switching and closing (`tab list` is allowed), window
-commands, `inspect` (opens a DevTools window), `record` (see below), `click --new-tab`,
-key chords that open or close tabs, nested `batch`, every connection or profile override
-flag, and the launch-affecting `--enable` and `--input-mode` (they differ from the
-previous invocation's flags, so the daemon dials another WebSocket and Chrome asks for
-another approval; `connect.sh --react` and per-action `--human` are the ways in).
+### What the guard permits
+
+The policy lives in `scripts/guard.sh` and is an **allow-list**: a fixed set of verb
+phrases, a fixed set of flags for each, and a refusal for everything else. It was a
+deny-list until 2026-09-18, and the reason for the inversion is that a deny-list defaults
+to *permit* for anything it has not heard of. Measured against agent-browser 0.38.1, that
+default was letting `plugin add`, `upgrade`, `install`, `stream enable --port`,
+`removeinitscript`, `clipboard read`, `webmcp invoke`, `auth login`, `state save` and the
+launch-affecting `--proxy`, `--extension`, `--init-script`, `--args`, `--ca-cert`,
+`--allow-file-access` and `--confirm-actions` through untouched — while still spending
+entries on `window` and `bringtofront`, which stopped being agent-browser commands
+somewhere before 0.38.1 and whose absence nothing detected.
+
+Permitted, in outline: page navigation and interaction, `frame` and `dialog`, observation
+(`snapshot`, `screenshot`, `get …`, `is …`, `find …`, `console`, `errors`, `diff
+snapshot|screenshot`), `eval`, `react …`, `vitals`, `a11y`, `pushstate`, `trace` and
+`profiler`, `network …`, `cookies`, `storage`, the emulation members of `set`, `tab list`,
+`batch` and `skills`. The table itself is the authoritative list.
+
+Refused, and worth knowing why:
+
+- Anything that creates, switches or closes a target: the `tab` family except `tab list`,
+  `click --new-tab`, `inspect`, and the key chords that open or restore a window.
+- `record`, which creates a browser context that Chrome shows as a separate window and
+  that `record stop` never disposes.
+- Every connection, profile and launch-affecting flag, because one whose value differs
+  from the previous invocation's makes the daemon dial another WebSocket and costs the
+  user another approval dialog. `connect.sh --react` and per-action `--human` are the
+  ways in.
+- `keydown` and `keyup`, which hold a modifier across commands and so split a chord into
+  pieces the chord check cannot see (`keydown Meta` then `press t`).
+- Commands that reach outside the browser session altogether: `plugin`, `upgrade`,
+  `install`, `doctor`, `stream`, `mcp`, `dashboard`, `chat`, `clipboard`, `webmcp`,
+  `auth`, `state`, `removeinitscript`, `confirm`, `deny`.
+- Nested `batch`, which would carry a whole unguarded program inside a guarded command.
+
+**It fails closed, and that is the trade.** A command agent-browser ships tomorrow will be
+refused until someone adds it to the table — exit 10, distinct from the exit 2 that means
+"deliberately forbidden", precisely so the two can be told apart. There is deliberately no
+environment override: an escape hatch named in an error message is one the agent will
+take, and a bare `agent-browser` call is the single outcome this skill exists to prevent.
+The recovery for exit 10 is to report it and add a line to `scripts/guard.sh`.
+
+`AB_DENY_EXPLAIN` in that file supplies the specific reason for a refusal. It is advisory
+only — it grants nothing, so an entry that goes stale degrades a message and never opens a
+hole. Presence in it is also what selects exit 2 over exit 10.
 
 ## Visible tab versus bound tab
 

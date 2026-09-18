@@ -395,6 +395,32 @@ else
       exit 5
     fi
   else
+    # A refused connection and a pending approval dialog are different failures
+    # with different recoveries, and the port was last probed before the endpoint
+    # was resolved. Re-probe it now rather than telling the user to approve a
+    # dialog that is not there: a browser that quit, crashed, or had remote
+    # debugging switched off produces "Connection refused", not a prompt.
+    if printf '%s' "$ATTACH_ERROR" | grep -Eq 'Connection refused|os error 61|ConnectionRefused'; then
+      if port_open; then
+        cat >&2 <<MSG
+✗ Chrome is listening on 127.0.0.1:$PORT, but it refused the CDP connection.
+  The endpoint this script resolved is no longer valid, which is what a Chrome
+  restart looks like: the browser is back, its DevTools endpoint is not the one
+  that was there a moment ago. Re-run this same connect command to resolve the
+  current endpoint. No blind retries were made.
+MSG
+      else
+        cat >&2 <<MSG
+✗ Nothing is listening on 127.0.0.1:$PORT any more; the connection was refused.
+  Chrome quit, crashed, or had remote debugging switched off between the port
+  check and the attach. This is not an approval dialog — do not wait for one.
+  Ask the user to confirm Chrome is running with remote debugging enabled
+  (chrome://inspect/#remote-debugging), then re-run this same connect command.
+MSG
+      fi
+      [ -z "$ATTACH_ERROR" ] || printf '  %s\n' "$ATTACH_ERROR" >&2
+      exit 4
+    fi
     echo "✗ Chrome is listening, but the single CDP connection did not complete." >&2
     [ -z "$ATTACH_ERROR" ] || printf '  %s\n' "$ATTACH_ERROR" >&2
     cat >&2 <<MSG
