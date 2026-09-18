@@ -236,3 +236,26 @@ Each session directory holds a `session.meta` key-value file: version, owner id 
 session, label, slot, port, CDP URL, socket dir, owned target id, created time. The
 dispatcher rejects any version other than the current one, and any file whose owner key
 does not match its owner id, slot and port.
+
+## Rejected: collapsing the scripts
+
+A review on 2026-09-04 sketched reducing these scripts to roughly 150 lines by dropping
+the per-session lock, the transactional rollback in `connect.sh`, and the symlink and
+ownership hardening on every path. That was considered and **rejected**, and the reasoning
+still holds:
+
+- The lock is what makes two wrapped commands on one session serialize. Without it two
+  agents sharing a browser interleave a `tab list` / command / `tab list` bracket and each
+  sees the other's binding as drift.
+- The rollback is what stops a failed attach from leaving a tab, a daemon and a half
+  written wrapper behind. A failed attach is not rare — it is what an unapproved Chrome
+  dialog produces.
+- The symlink and `-O` ownership checks guard a wrapper root that lives in a shared
+  temp directory.
+
+Line count is not the constraint here; a wrong tab in the user's browser is. Anything
+proposing to remove one of these three should say what it does about the failure that
+motivated it. This note exists so the same simplification is not re-proposed on the
+strength of the line count alone — it is the one decision worth carrying forward from
+`docs/spec-2026-09-04-harness-portability-and-noise.md`, which was removed once it had
+been implemented and had gone stale.
