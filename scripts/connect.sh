@@ -211,8 +211,7 @@ fi
 PREV_OWNED_TARGET_ID="$(ab_meta_value "$META" owned_target_id 2>/dev/null || true)"
 [[ "$PREV_OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]] || PREV_OWNED_TARGET_ID=""
 
-if ! SESSION_INFO="$("$AGENT_BROWSER_BIN" --session "$SESSION" session info --json 2>"$DIR/session-info.err")" \
-  || ! SESSION_FIELDS="$(printf '%s' "$SESSION_INFO" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" session-info "$SESSION" 2>>"$DIR/session-info.err")"; then
+if ! ab_session_info "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION" "$DIR/session-info.err"; then
   echo "✗ Could not validate agent-browser session state; no browser connection was attempted." >&2
   [ ! -s "$DIR/session-info.err" ] || sed 's/^/  /' "$DIR/session-info.err" >&2
   rm -f "$DIR/session-info.err"
@@ -220,8 +219,8 @@ if ! SESSION_INFO="$("$AGENT_BROWSER_BIN" --session "$SESSION" session info --js
   exit 5
 fi
 rm -f "$DIR/session-info.err"
-SESSION_WAS_ACTIVE="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '1p')"
-SOCKET_DIR="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '4p')"
+SESSION_WAS_ACTIVE="$AB_SESSION_ACTIVE"
+SOCKET_DIR="$AB_SESSION_SOCKET_DIR"
 [ -n "$SOCKET_DIR" ] || SOCKET_DIR="$(ab_default_socket_dir)"
 
 # Um upgrade do agent-browser deixa o daemon da sessão anterior numa versão
@@ -232,7 +231,7 @@ SOCKET_DIR="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '4p')"
 # `session info` não reinicia nada e já reporta a versão do daemon, então a
 # troca é feita aqui, deliberadamente, em vez de virar um relançamento no meio
 # de um comando.
-DAEMON_VERSION="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '5p')"
+DAEMON_VERSION="$AB_SESSION_VERSION"
 CLI_VERSION="$(ab_cli_version "$AGENT_BROWSER_BIN" 2>/dev/null || true)"
 if [ "$SESSION_WAS_ACTIVE" = "1" ] && [ -n "$DAEMON_VERSION" ] && [ -n "$CLI_VERSION" ] \
   && [ "$DAEMON_VERSION" != "$CLI_VERSION" ]; then
@@ -286,8 +285,8 @@ rollback() {
         rollback_target="$OWNED_TARGET_ID"
         if [ -z "$rollback_target" ] \
           && rollback_list="$("$AGENT_BROWSER_BIN" --session "$SESSION" tab list --json 2>/dev/null)" \
-          && rollback_state="$(printf '%s' "$rollback_list" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" tab-state 2>/dev/null)"; then
-          rollback_target="$(printf '%s\n' "$rollback_state" | sed -n '1p')"
+          && ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "" "$rollback_list"; then
+          rollback_target="$AB_TAB_ACTIVE"
         fi
         if [ -n "$rollback_target" ] && [[ "$rollback_target" =~ ^[A-Za-z0-9_-]+$ ]]; then
           "$AGENT_BROWSER_BIN" --session "$SESSION" tab close "$rollback_target" >/dev/null 2>&1 || true
@@ -338,7 +337,7 @@ for META_VALUE in "$OWNER_ID" "$OWNER_KEY" "$SESSION" "$LABEL" "$SLOT" "$CDP_URL
   }
 done
 {
-  printf 'version=4\n'
+  printf 'version=%s\n' "$AB_META_VERSION"
   printf 'owner_id=%s\n' "$OWNER_ID"
   printf 'owner_key=%s\n' "$OWNER_KEY"
   printf 'session=%s\n' "$SESSION"
@@ -455,9 +454,9 @@ fi
 # Page.bringToFront the recovery costs) instead of adopting a foreign tab.
 if [ -n "$PREV_OWNED_TARGET_ID" ]; then
   if PREV_LIST="$(browser_command tab list --json 2>/dev/null)" \
-    && PREV_STATE="$(printf '%s' "$PREV_LIST" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" tab-state "$PREV_OWNED_TARGET_ID" 2>/dev/null)"; then
-    PREV_ACTIVE="$(printf '%s\n' "$PREV_STATE" | sed -n '1p')"
-    PREV_PRESENT="$(printf '%s\n' "$PREV_STATE" | sed -n '2p')"
+    && ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$PREV_OWNED_TARGET_ID" "$PREV_LIST"; then
+    PREV_ACTIVE="$AB_TAB_ACTIVE"
+    PREV_PRESENT="$AB_TAB_OWNED_PRESENT"
     if [ "$PREV_PRESENT" = "1" ] && [ "$PREV_ACTIVE" != "$PREV_OWNED_TARGET_ID" ]; then
       ATTACH_BOUND_URL="$BOUND"
       if browser_command tab "$PREV_OWNED_TARGET_ID" --json >/dev/null 2>"$DIR/rebind.err" \
@@ -511,13 +510,13 @@ if [ -n "$URL" ] && [ "$BOUND" != "$URL" ]; then
 fi
 
 if ! TAB_LIST="$(browser_command tab list --json 2>"$DIR/target.err")" \
-  || ! TAB_STATE="$(printf '%s' "$TAB_LIST" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" tab-state 2>"$DIR/target.err")"; then
+  || ! ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "" "$TAB_LIST"; then
   echo "✗ Connected, but could not record the owned target safely." >&2
   [ ! -s "$DIR/target.err" ] || sed 's/^/  /' "$DIR/target.err" >&2
   exit 5
 fi
 rm -f "$DIR/target.err"
-OWNED_TARGET_ID="$(printf '%s\n' "$TAB_STATE" | sed -n '1p')"
+OWNED_TARGET_ID="$AB_TAB_ACTIVE"
 if [ -z "$OWNED_TARGET_ID" ] || [[ ! "$OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
   echo "✗ Connected, but agent-browser reported no active target to own." >&2
   exit 5

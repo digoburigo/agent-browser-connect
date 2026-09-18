@@ -69,6 +69,24 @@ if (command === "batch-argument") {
   process.stdout.write(`${splitShellWords(input).join("\u001f")}\n`);
   process.exit(0);
 }
+if (command === "batch-encode") {
+  // C4: the dispatcher guards the words it parsed, then has to hand agent-browser
+  // something to run. Handing back the ORIGINAL string means two parsers decide
+  // one policy, and they do not agree on every input (this splitter treats a tab
+  // as an ordinary character; a shell does not). Re-encoding the guarded words as
+  // the JSON stdin form removes the second parse entirely: what was checked is
+  // exactly what runs.
+  const commands = input
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => line.split("\u001f"));
+  if (commands.length === 0) {
+    fail("batch-encode received no commands");
+  }
+  process.stdout.write(`${JSON.stringify(commands)}\n`);
+  process.exit(0);
+}
+
 const payload = parseInput(input);
 
 if (
@@ -107,7 +125,11 @@ if (command === "session-info") {
   // that restart never happens mid-command.
   const versionValue = payload.data.version ?? payload.data.runtime?.version ?? "";
   const version = typeof versionValue === "string" ? validateString(versionValue, "version") : "";
-  process.stdout.write(`${active}\n${pid}\n${pageCount}\n${socketDir}\n${version}\n`);
+  // Named fields, not bare lines in a fixed order: three shell scripts read this
+  // and a reordering here used to corrupt all of them silently.
+  process.stdout.write(
+    `active=${active}\npid=${pid}\npage_count=${pageCount}\nsocket_dir=${socketDir}\nversion=${version}\n`
+  );
   process.exit(0);
 }
 
@@ -130,7 +152,9 @@ if (command === "tab-state") {
   if (expected) {
     expectedPresent = tabs.some((tab) => tab?.targetId === expected) ? "1" : "0";
   }
-  process.stdout.write(`${activeTarget}\n${expectedPresent}\n${tabs.length}\n`);
+  process.stdout.write(
+    `active_target=${activeTarget}\nowned_present=${expectedPresent}\ncount=${tabs.length}\n`
+  );
   process.exit(0);
 }
 

@@ -18,9 +18,11 @@ cleanup_suite() {
 }
 trap cleanup_suite EXIT INT TERM
 
-# The allow-list policy is a pure function and is tested without a daemon; run it
-# first so a policy regression fails before any of the slow mock cases start.
+# The allow-list policy and the structured lib readers are pure functions tested
+# without a daemon; run them first so a regression there fails before any of the
+# slow mock cases start.
 bash "$SKILL_DIR/tests/guard.sh"
+bash "$SKILL_DIR/tests/lib-interfaces.sh"
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
@@ -282,9 +284,10 @@ case "$ACTION" in
   batch)
     touch "$ACTIVE_FILE"
     ensure_target
-    if [ "$#" -eq 0 ]; then
-      cat >/dev/null
-    fi
+    # Record whatever arrived on stdin. Argument-mode batch now re-encodes the
+    # guarded words to the JSON stdin form, so the test can assert that what the
+    # guard checked is what the CLI was handed.
+    [ -t 0 ] || cat > "$MOCK_STATE_DIR/batch-stdin" 2>/dev/null || true
     echo "batched"
     ;;
   network)
@@ -482,6 +485,23 @@ UNKNOWN_OUTPUT="$(assert_wrapper_status "$AB" 10 snapshot --brand-new-flag)"
 assert_text_contains "$UNKNOWN_OUTPUT" "not in this wrapper allow-list"
 BATCH_OUTPUT="$(run_wrapper success "$AB" batch 'get url' 'snapshot -i')"
 assert_eq "$BATCH_OUTPUT" "batched"
+# C4: the words the guard checked are the words the CLI runs. Argument mode now
+# re-encodes to the JSON stdin form instead of handing back the original string
+# for a second, differently-behaved parser to split.
+assert_file_contains "$CASE_STATE/batch-stdin" '[["get","url"],["snapshot","-i"]]'
+assert_file_not_contains "$CASE_LOG" "snapshot\\ -i"
+# A tab inside an argument stays one word end to end. json.mjs does not split on
+# it, so a downstream whitespace splitter must never get the chance to.
+rm -f "$CASE_STATE/batch-stdin"
+BATCH_OUTPUT="$(run_wrapper success "$AB" batch "$(printf 'fill @e1 hello\tworld')")"
+assert_eq "$BATCH_OUTPUT" "batched"
+assert_file_contains "$CASE_STATE/batch-stdin" '[["fill","@e1","hello\tworld"]]'
+# --bail stays a CLI flag; it is not smuggled into the command array.
+rm -f "$CASE_STATE/batch-stdin"
+BATCH_OUTPUT="$(run_wrapper success "$AB" batch --bail 'get url')"
+assert_eq "$BATCH_OUTPUT" "batched"
+assert_file_contains "$CASE_STATE/batch-stdin" '[["get","url"]]'
+assert_file_contains "$CASE_LOG" "--bail"
 BATCH_OUTPUT="$(printf '[["snapshot","-i"],["fill","@e2","hello world"]]' | run_wrapper success "$AB" batch)"
 assert_eq "$BATCH_OUTPUT" "batched"
 CALLS_BEFORE_STDIN_REJECT="$(wc -l < "$CASE_LOG" | tr -d ' ')"

@@ -160,6 +160,53 @@ back to it before navigating. Without this, a drifted daemon would have the re-r
 navigate whatever tab was active (the user's, or another agent's) and record it as
 owned.
 
+## Structured reads: json.mjs, and session.meta
+
+`json.mjs` prints `key=value` lines and the shell reads them by name through
+`ab__field`. It used to print bare lines whose meaning was their position, and 22
+call sites across `connect.sh`, `dispatch.sh` and `cleanup.sh` decoded them with
+`sed -n '5p'`. Adding a field was safe only at the end, reordering one corrupted
+three scripts at once, and nothing failed when it happened. Two readers in
+`lib.sh` own the shapes now:
+
+- `ab_session_info` runs `session info` and publishes `AB_SESSION_*`. It never
+  passes `--cdp`, and that is the point: asking whether a session is alive must
+  not be able to open a connection or launch a bundled browser, and `session
+  info` is also the one call that does not restart a version-mismatched daemon.
+  That rule used to be a comment repeated at three call sites; it is now a
+  property of the function, and a test asserts the flag never appears.
+- `ab_tab_state` publishes `AB_TAB_*` from `tab list --json`. The command itself
+  stays with the caller because the invocation legitimately differs — attached
+  callers pass `--cdp --pin-tab --session`, teardown must not — so only the shape
+  moved.
+
+`session.meta` gained an interface for the same reason. The ownership invariant
+is the one safety property this repo has, and it was transcribed three times:
+`dispatch.sh` hard-failed on a malformed CDP URL, `cleanup.sh` quietly downgraded
+the identical condition to "not proven", and `connect.sh` checked only the owner
+key. `ab_load_meta` is the single implementation. It validates version, session,
+owner key against `H(owner_id|slot|port)`, the CDP endpoint and the owned target,
+publishes `AB_META_*`, and on failure sets `AB_META_ERROR` to something the
+caller can print. Callers still decide what a failure *means* — dispatch refuses
+the command, cleanup preserves every Chrome target — but they no longer disagree
+about what a valid record is. `AB_META_VERSION` replaces the bare `4` that used
+to appear in all three files.
+
+## Batch: what is guarded is what runs
+
+`batch` in argument mode used to be checked and then forwarded differently. Each
+argument was split by `json.mjs`, the resulting words were guarded, and then the
+**original string** was handed to agent-browser to parse again. Two parsers
+deciding one policy only holds while they agree, and they did not: `json.mjs`
+splits on spaces and treats a tab as an ordinary character, so
+`batch $'tab\tnew http://x'` guarded as the single unknown verb `tab<TAB>new`
+while a whitespace-splitting parser downstream could read it as `tab new`.
+
+The dispatcher now re-encodes the guarded words with `json.mjs batch-encode` and
+sends them as the JSON array-of-arrays that the stdin path already used. There is
+one parse, and the words the guard approved are the words that run. `--bail` and
+`--json` stay CLI flags and are not folded into the command array.
+
 ## Containment boundary
 
 The page count from `tab list` covers every page in Chrome, including the user's own

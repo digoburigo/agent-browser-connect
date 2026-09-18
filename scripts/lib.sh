@@ -434,3 +434,179 @@ ab_pid_has_cdp_connection() {
   printf '%s\n' "$connections" \
     | grep -Eq -- "->(127\\.0\\.0\\.1|\\[::1\\]):$port([[:space:]]|\\()"
 }
+
+# ---------------------------------------------------------------------------
+# Structured reads of agent-browser's JSON, and of session.meta.
+#
+# json.mjs prints `key=value` lines. It used to print bare lines whose meaning
+# was their position, and 22 call sites across three scripts decoded them with
+# `sed -n '5p'`, so adding or reordering a field corrupted all three at once
+# without failing anything. The shape now lives here and callers read names.
+# ---------------------------------------------------------------------------
+
+# The only session.meta layout these scripts accept. Written by connect.sh,
+# required by dispatch.sh and cleanup.sh; it was a bare `4` in all three.
+AB_META_VERSION=4
+
+# One value out of a key=value blob.
+ab__field() {
+  local blob="$1"
+  local key="$2"
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      "$key"=*)
+        printf '%s' "${line#*=}"
+        return 0
+        ;;
+    esac
+  done <<FIELDS
+$blob
+FIELDS
+  return 1
+}
+
+# Ask the daemon about a session and publish the answer as AB_SESSION_*.
+#
+# Deliberately never passes --cdp: `session info` is the one call that must not
+# be able to spawn a connection or a bundled browser just because something
+# asked whether the session was alive, and it is also the one call that does not
+# restart a version-mismatched daemon. That used to be a comment at three call
+# sites; here it is a property of the function.
+#
+#   0  fields published
+#   1  the CLI call failed
+#   2  the CLI answered, but not for this session
+ab_session_info() {
+  local bin="$1"
+  local node="$2"
+  local helper="$3"
+  local session="$4"
+  local err="${5:-/dev/null}"
+  local raw fields
+
+  AB_SESSION_ACTIVE=""
+  AB_SESSION_PID=""
+  AB_SESSION_PAGE_COUNT=""
+  AB_SESSION_SOCKET_DIR=""
+  AB_SESSION_VERSION=""
+
+  raw="$("$bin" --session "$session" session info --json 2>>"$err")" || return 1
+  fields="$(printf '%s' "$raw" | "$node" "$helper" session-info "$session" 2>>"$err")" || return 2
+
+  AB_SESSION_ACTIVE="$(ab__field "$fields" active || true)"
+  AB_SESSION_PID="$(ab__field "$fields" pid || true)"
+  AB_SESSION_PAGE_COUNT="$(ab__field "$fields" page_count || true)"
+  AB_SESSION_SOCKET_DIR="$(ab__field "$fields" socket_dir || true)"
+  AB_SESSION_VERSION="$(ab__field "$fields" version || true)"
+  return 0
+}
+
+# Publish `tab list --json` output as AB_TAB_*. The command itself stays with the
+# caller on purpose: an attached caller must pass --cdp --pin-tab --session and
+# teardown must not, and that difference is load-bearing. Only the shape is here.
+ab_tab_state() {
+  local node="$1"
+  local helper="$2"
+  local expected="$3"
+  local json="$4"
+  local fields
+
+  AB_TAB_ACTIVE=""
+  AB_TAB_OWNED_PRESENT=""
+  AB_TAB_COUNT=""
+
+  fields="$(printf '%s' "$json" | "$node" "$helper" tab-state "$expected" 2>/dev/null)" || return 1
+
+  AB_TAB_ACTIVE="$(ab__field "$fields" active_target || true)"
+  AB_TAB_OWNED_PRESENT="$(ab__field "$fields" owned_present || true)"
+  AB_TAB_COUNT="$(ab__field "$fields" count || true)"
+  return 0
+}
+
+# Load and fully validate a session.meta, publishing AB_META_*.
+#
+# The ownership invariant is the one safety property this repo has, and it used
+# to be implemented three times: dispatch.sh hard-failed on a bad CDP URL,
+# cleanup.sh downgraded the same condition to "not proven", and connect.sh
+# checked only the owner key. One implementation, and callers choose what a
+# failure means to them.
+#
+# require_target=1 additionally demands a recorded owned target; connect.sh
+# writes the file before it knows one, so that is not always an error.
+# On failure returns 1 with AB_META_ERROR set to a caller-printable reason.
+ab_load_meta() {
+  local file="$1"
+  local expected_session="${2:-}"
+  local require_target="${3:-1}"
+  local version expected_key
+
+  AB_META_ERROR=""
+  AB_META_SESSION=""
+  AB_META_OWNER_ID=""
+  AB_META_OWNER_KEY=""
+  AB_META_SLOT=""
+  AB_META_PORT=""
+  AB_META_CDP_URL=""
+  AB_META_LABEL=""
+  AB_META_SOCKET_DIR=""
+  AB_META_OWNED_TARGET_ID=""
+
+  if [ ! -f "$file" ] || [ -L "$file" ]; then
+    AB_META_ERROR="session metadata is missing or is a symlink"
+    return 1
+  fi
+
+  version="$(ab_meta_value "$file" version 2>/dev/null || true)"
+  if [ "$version" != "$AB_META_VERSION" ]; then
+    AB_META_ERROR="session metadata is version '${version:-none}', not $AB_META_VERSION"
+    return 1
+  fi
+
+  AB_META_SESSION="$(ab_meta_value "$file" session 2>/dev/null || true)"
+  AB_META_OWNER_ID="$(ab_meta_value "$file" owner_id 2>/dev/null || true)"
+  AB_META_OWNER_KEY="$(ab_meta_value "$file" owner_key 2>/dev/null || true)"
+  AB_META_SLOT="$(ab_meta_value "$file" slot 2>/dev/null || true)"
+  AB_META_CDP_URL="$(ab_meta_value "$file" cdp_url 2>/dev/null || true)"
+  AB_META_LABEL="$(ab_meta_value "$file" label 2>/dev/null || true)"
+  AB_META_SOCKET_DIR="$(ab_meta_value "$file" socket_dir 2>/dev/null || true)"
+  AB_META_OWNED_TARGET_ID="$(ab_meta_value "$file" owned_target_id 2>/dev/null || true)"
+  AB_META_PORT="$(ab_normalize_port "$(ab_meta_value "$file" port 2>/dev/null || true)" 2>/dev/null || true)"
+
+  if ! ab_validate_session "$AB_META_SESSION"; then
+    AB_META_ERROR="session metadata names an invalid session"
+    return 1
+  fi
+  if [ -n "$expected_session" ] && [ "$AB_META_SESSION" != "$expected_session" ]; then
+    AB_META_ERROR="session metadata is for '$AB_META_SESSION', not '$expected_session'"
+    return 1
+  fi
+  case "$AB_META_OWNER_KEY" in
+    ''|*[!A-Fa-f0-9]*)
+      AB_META_ERROR="session metadata has a malformed owner key"
+      return 1
+      ;;
+  esac
+  if [ "${#AB_META_OWNER_KEY}" -ne 64 ]; then
+    AB_META_ERROR="session metadata has an owner key of the wrong length"
+    return 1
+  fi
+  if [ -z "$AB_META_OWNER_ID" ] || ! ab_validate_slot "$AB_META_SLOT" || [ -z "$AB_META_PORT" ]; then
+    AB_META_ERROR="session metadata has an incomplete owner identity"
+    return 1
+  fi
+  expected_key="$(ab_owner_key "$AB_META_OWNER_ID" "$AB_META_SLOT" "$AB_META_PORT" 2>/dev/null || true)"
+  if [ -z "$expected_key" ] || [ "$AB_META_OWNER_KEY" != "$expected_key" ]; then
+    AB_META_ERROR="session metadata ownership is inconsistent with its owner id, slot and port"
+    return 1
+  fi
+  if [[ ! "$AB_META_CDP_URL" =~ ^ws://127\.0\.0\.1:${AB_META_PORT}/devtools/browser(/[A-Za-z0-9._-]+)?$ ]]; then
+    AB_META_ERROR="session metadata has an invalid CDP endpoint"
+    return 1
+  fi
+  if [ "$require_target" = "1" ] && [[ ! "$AB_META_OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    AB_META_ERROR="session metadata records no valid owned target"
+    return 1
+  fi
+  return 0
+}

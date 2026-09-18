@@ -72,31 +72,26 @@ release_owner_lock() {
 trap release_owner_lock EXIT
 trap 'release_owner_lock; exit 130' INT TERM
 
-META_VERSION="$(ab_meta_value "$META" version 2>/dev/null || true)"
-META_SESSION="$(ab_meta_value "$META" session 2>/dev/null || true)"
-OWNER_ID="$(ab_meta_value "$META" owner_id 2>/dev/null || true)"
-OWNER_KEY="$(ab_meta_value "$META" owner_key 2>/dev/null || true)"
-SLOT="$(ab_meta_value "$META" slot 2>/dev/null || true)"
-PORT_RAW="$(ab_meta_value "$META" port 2>/dev/null || printf '%s' "${AB_CDP_PORT:-9222}")"
-PORT="$(ab_normalize_port "$PORT_RAW" 2>/dev/null || true)"
-CDP_URL="$(ab_meta_value "$META" cdp_url 2>/dev/null || true)"
-META_SOCKET_DIR="$(ab_meta_value "$META" socket_dir 2>/dev/null || true)"
-OWNED_TARGET_ID="$(ab_meta_value "$META" owned_target_id 2>/dev/null || true)"
-
+# Exactly the same ownership check dispatch.sh makes, from the same
+# implementation. The two used to be separate transcriptions of one invariant
+# that had already drifted apart: dispatch hard-failed on a malformed CDP URL
+# where cleanup silently treated it as merely unproven.
 PROVEN_TARGET_ID=""
-EXPECTED_OWNER_KEY=""
-if [ -n "$OWNER_ID" ] && [ -n "$SLOT" ] && [ -n "$PORT" ]; then
-  EXPECTED_OWNER_KEY="$(ab_owner_key "$OWNER_ID" "$SLOT" "$PORT" 2>/dev/null || true)"
-fi
-if [ "$META_VERSION" = "4" ] \
-  && [ "$META_SESSION" = "$SESSION" ] \
-  && [ -n "$EXPECTED_OWNER_KEY" ] \
-  && [ "$OWNER_KEY" = "$EXPECTED_OWNER_KEY" ] \
-  && [ "${#OWNER_KEY}" -eq 64 ] \
-  && [[ "$OWNER_KEY" =~ ^[A-Fa-f0-9]+$ ]] \
-  && [[ "$CDP_URL" =~ ^ws://127\.0\.0\.1:${PORT}/devtools/browser(/[A-Za-z0-9._-]+)?$ ]] \
-  && [[ "$OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
-  PROVEN_TARGET_ID="$OWNED_TARGET_ID"
+OWNED_TARGET_ID=""
+PORT=""
+META_SOCKET_DIR=""
+if ab_load_meta "$META" "$SESSION" 1; then
+  PROVEN_TARGET_ID="$AB_META_OWNED_TARGET_ID"
+  OWNED_TARGET_ID="$AB_META_OWNED_TARGET_ID"
+  PORT="$AB_META_PORT"
+  META_SOCKET_DIR="$AB_META_SOCKET_DIR"
+else
+  # Unproven is not the same as absent: a target id may still be recorded in a
+  # file whose ownership cannot be verified, and the operator should hear that
+  # every Chrome target is being preserved rather than that nothing was found.
+  OWNED_TARGET_ID="$(ab_meta_value "$META" owned_target_id 2>/dev/null || true)"
+  META_SOCKET_DIR="$(ab_meta_value "$META" socket_dir 2>/dev/null || true)"
+  PORT="$(ab_normalize_port "$(ab_meta_value "$META" port 2>/dev/null || printf '%s' "${AB_CDP_PORT:-9222}")" 2>/dev/null || true)"
 fi
 if [ "$CLOSE_TAB" -eq 1 ] && [ -n "$OWNED_TARGET_ID" ] && [ -z "$PROVEN_TARGET_ID" ]; then
   echo "! Session metadata does not prove exact target ownership; every Chrome target will be preserved." >&2
@@ -113,18 +108,29 @@ if [ -z "$NODE_BIN" ] || [ "${NODE_BIN#/}" = "$NODE_BIN" ] || [ ! -x "$NODE_BIN"
   exit 3
 fi
 
-if ! SESSION_INFO="$("$AGENT_BROWSER_BIN" --session "$SESSION" session info --json 2> >(sed 's/^/  /' >&2))"; then
+# A temp file rather than a process substitution: output from `2> >(...)` can
+# arrive after the script has already moved on, so a diagnostic could be lost or
+# interleaved with the line that replaced it.
+SESSION_INFO_ERR="$ROOT/.cleanup-$SESSION.$$.err"
+: > "$SESSION_INFO_ERR"
+SESSION_INFO_STATUS=0
+ab_session_info "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION" "$SESSION_INFO_ERR" \
+  || SESSION_INFO_STATUS=$?
+if [ "$SESSION_INFO_STATUS" -eq 1 ]; then
   echo "✗ Could not inspect session $SESSION; wrapper and bindings were retained." >&2
+  [ ! -s "$SESSION_INFO_ERR" ] || sed 's/^/  /' "$SESSION_INFO_ERR" >&2
+  rm -f "$SESSION_INFO_ERR"
   exit 5
 fi
-if ! SESSION_FIELDS="$(printf '%s' "$SESSION_INFO" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" session-info "$SESSION" 2>/dev/null)"; then
+rm -f "$SESSION_INFO_ERR"
+if [ "$SESSION_INFO_STATUS" -ne 0 ]; then
   echo "✗ agent-browser returned mismatched session diagnostics; wrapper and bindings were retained." >&2
   exit 5
 fi
-ACTIVE="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '1p')"
-PID="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '2p')"
-PAGE_COUNT="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '3p')"
-SOCKET_DIR="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '4p')"
+ACTIVE="$AB_SESSION_ACTIVE"
+PID="$AB_SESSION_PID"
+PAGE_COUNT="$AB_SESSION_PAGE_COUNT"
+SOCKET_DIR="$AB_SESSION_SOCKET_DIR"
 [ -n "$SOCKET_DIR" ] || SOCKET_DIR="$META_SOCKET_DIR"
 [ -n "$SOCKET_DIR" ] || SOCKET_DIR="$(ab_default_socket_dir)"
 
@@ -153,8 +159,8 @@ if [ "$ACTIVE" = "1" ] && [ -n "$PID" ] && [ -n "$PORT" ]; then
       if [ -n "$PROVEN_TARGET_ID" ]; then
         OWNED_PRESENT=""
         if TAB_LIST="$("$AGENT_BROWSER_BIN" --session "$SESSION" tab list --json 2>/dev/null)" \
-          && TAB_STATE="$(printf '%s' "$TAB_LIST" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" tab-state "$PROVEN_TARGET_ID" 2>/dev/null)"; then
-          OWNED_PRESENT="$(printf '%s\n' "$TAB_STATE" | sed -n '2p')"
+          && ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$PROVEN_TARGET_ID" "$TAB_LIST"; then
+          OWNED_PRESENT="$AB_TAB_OWNED_PRESENT"
         fi
         if [ "$OWNED_PRESENT" = "0" ]; then
           : # The exact owned target is already gone; foreign targets stay untouched.

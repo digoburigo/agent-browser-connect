@@ -42,47 +42,18 @@ release_owner_lock() {
 trap release_owner_lock EXIT
 trap 'release_owner_lock; exit 130' INT TERM
 
-if [ "$(ab_meta_value "$META" version 2>/dev/null || true)" != "4" ]; then
-  echo "✗ Browser wrapper metadata is outdated; re-run connect.sh." >&2
-  exit 5
+if ! ab_load_meta "$META" "$PATH_SESSION" 1; then
+  echo "✗ Browser wrapper metadata is outdated or unusable ($AB_META_ERROR); re-run connect.sh." >&2
+  case "$AB_META_ERROR" in
+    *"owned target"*) exit 8 ;;
+    *) exit 5 ;;
+  esac
 fi
+SESSION="$AB_META_SESSION"
+PORT="$AB_META_PORT"
+CDP_URL="$AB_META_CDP_URL"
+OWNED_TARGET_ID="$AB_META_OWNED_TARGET_ID"
 
-SESSION="$(ab_meta_value "$META" session 2>/dev/null || true)"
-OWNER_ID="$(ab_meta_value "$META" owner_id 2>/dev/null || true)"
-OWNER_KEY="$(ab_meta_value "$META" owner_key 2>/dev/null || true)"
-SLOT="$(ab_meta_value "$META" slot 2>/dev/null || true)"
-PORT_RAW="$(ab_meta_value "$META" port 2>/dev/null || true)"
-CDP_URL="$(ab_meta_value "$META" cdp_url 2>/dev/null || true)"
-OWNED_TARGET_ID="$(ab_meta_value "$META" owned_target_id 2>/dev/null || true)"
-PORT="$(ab_normalize_port "$PORT_RAW" 2>/dev/null || true)"
-
-ab_validate_session "$SESSION" || {
-  echo "✗ Browser wrapper contains an invalid session; re-run connect.sh." >&2
-  exit 5
-}
-case "$OWNER_KEY" in
-  ''|*[!A-Fa-f0-9]*)
-    echo "✗ Browser wrapper contains an invalid owner key; re-run connect.sh." >&2
-    exit 5
-    ;;
-esac
-[ "${#OWNER_KEY}" -eq 64 ] || {
-  echo "✗ Browser wrapper contains an invalid owner key; re-run connect.sh." >&2
-  exit 5
-}
-if [ -z "$OWNER_ID" ] || ! ab_validate_slot "$SLOT" \
-  || [ "$(ab_owner_key "$OWNER_ID" "$SLOT" "$PORT" 2>/dev/null || true)" != "$OWNER_KEY" ]; then
-  echo "✗ Browser wrapper ownership metadata is inconsistent; re-run connect.sh." >&2
-  exit 5
-fi
-[ "$(basename "$DIR")" = "$SESSION" ] || {
-  echo "✗ Browser wrapper path does not match its session metadata." >&2
-  exit 5
-}
-if [ -z "$PORT" ] || [[ ! "$CDP_URL" =~ ^ws://127\.0\.0\.1:${PORT}/devtools/browser(/[A-Za-z0-9._-]+)?$ ]]; then
-  echo "✗ Browser wrapper contains an invalid CDP endpoint; re-run connect.sh." >&2
-  exit 5
-fi
 if [ "${AGENT_BROWSER_BIN#/}" = "$AGENT_BROWSER_BIN" ] || [ ! -x "$AGENT_BROWSER_BIN" ]; then
   echo "✗ The agent-browser executable recorded by connect.sh is unavailable." >&2
   exit 3
@@ -90,10 +61,6 @@ fi
 if [ "${NODE_BIN#/}" = "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
   echo "✗ The node executable recorded by connect.sh is unavailable." >&2
   exit 3
-fi
-if [ -z "$OWNED_TARGET_ID" ] || [[ ! "$OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
-  echo "✗ Browser wrapper has no valid owned target; re-run connect.sh." >&2
-  exit 8
 fi
 
 # Every command is checked against the allow-list in guard.sh before the daemon
@@ -107,9 +74,14 @@ ab_guard_command 1 "$@" || exit $?
 BATCH_STDIN=""
 if [ "${1:-}" = "batch" ]; then
   BATCH_HAS_COMMANDS=0
+  BATCH_GUARDED=""
+  BATCH_FLAGS=()
   for argument in "${@:2}"; do
     case "$argument" in
-      --bail|--json) continue ;;
+      --bail|--json)
+        BATCH_FLAGS+=("$argument")
+        continue
+        ;;
     esac
     BATCH_HAS_COMMANDS=1
     if ! BATCH_LINE="$(printf '%s' "$argument" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" batch-argument 2>&1)"; then
@@ -125,7 +97,23 @@ if [ "${1:-}" = "batch" ]; then
     fi
     IFS=$'\x1f' read -ra BATCH_WORDS <<< "$BATCH_LINE"
     ab_guard_command 0 "${BATCH_WORDS[@]}" || exit $?
+    BATCH_GUARDED="$BATCH_GUARDED$BATCH_LINE
+"
   done
+  if [ "$BATCH_HAS_COMMANDS" -eq 1 ]; then
+    # Forward the words that were guarded, not the strings they were parsed from.
+    # Handing agent-browser the original argument would make two parsers decide
+    # one policy, and they disagree: json.mjs splits on spaces and treats a tab as
+    # an ordinary character, so `batch $'tab\tnew http://x'` guards as the single
+    # unknown verb "tab<TAB>new" while a whitespace-splitting parser downstream
+    # could read it as `tab new`. Re-encoding to the JSON stdin form, which is
+    # already the shape the stdin path uses, removes the second parse entirely.
+    if ! BATCH_STDIN="$(printf '%s' "$BATCH_GUARDED" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" batch-encode 2>&1)"; then
+      echo "✗ batch commands could not be re-encoded safely: $BATCH_STDIN" >&2
+      exit 2
+    fi
+    set -- batch ${BATCH_FLAGS[@]+"${BATCH_FLAGS[@]}"}
+  fi
   if [ "$BATCH_HAS_COMMANDS" -eq 0 ]; then
     if [ -t 0 ]; then
       echo "✗ 'batch' needs quoted command arguments or a JSON array on stdin." >&2
@@ -144,16 +132,19 @@ if [ "${1:-}" = "batch" ]; then
   fi
 fi
 
-if ! SESSION_INFO="$("$AGENT_BROWSER_BIN" --session "$SESSION" session info --json 2>/dev/null)"; then
+# `|| STATUS=$?` rather than a bare call: a non-zero return from a standalone
+# statement would trip `set -e` before the status could be inspected.
+SESSION_INFO_STATUS=0
+ab_session_info "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION" || SESSION_INFO_STATUS=$?
+if [ "$SESSION_INFO_STATUS" -eq 1 ]; then
   echo "✗ Could not inspect browser session $SESSION; re-run connect.sh." >&2
   exit 8
 fi
-if ! SESSION_FIELDS="$(printf '%s' "$SESSION_INFO" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" session-info "$SESSION" 2>/dev/null)"; then
+if [ "$SESSION_INFO_STATUS" -ne 0 ]; then
   echo "✗ Browser diagnostics did not match session $SESSION; re-run connect.sh." >&2
   exit 8
 fi
-ACTIVE="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '1p')"
-if [ "$ACTIVE" != "1" ]; then
+if [ "$AB_SESSION_ACTIVE" != "1" ]; then
   echo "✗ Browser session $SESSION is inactive; re-run connect.sh instead of letting this wrapper reconnect implicitly." >&2
   exit 8
 fi
@@ -162,7 +153,7 @@ fi
 # daemon, so it is where the mismatch gets caught. The next browser command
 # would restart the daemon mid-dispatch, which drops the CDP attachment and can
 # launch a substitute Chrome; connect.sh does the swap deliberately instead.
-DAEMON_VERSION="$(printf '%s\n' "$SESSION_FIELDS" | sed -n '5p')"
+DAEMON_VERSION="$AB_SESSION_VERSION"
 CLI_VERSION="$(ab_cli_version "$AGENT_BROWSER_BIN" 2>/dev/null || true)"
 if [ -n "$DAEMON_VERSION" ] && [ -n "$CLI_VERSION" ] && [ "$DAEMON_VERSION" != "$CLI_VERSION" ]; then
   ab_log_event "$DIR" version-mismatch "daemon=$DAEMON_VERSION cli=$CLI_VERSION command=${1:-}"
@@ -174,23 +165,24 @@ browser_command() {
   "$AGENT_BROWSER_BIN" --cdp "$CDP_URL" --pin-tab --session "$SESSION" "$@"
 }
 
+# Publishes AB_TAB_ACTIVE / AB_TAB_OWNED_PRESENT / AB_TAB_COUNT.
 read_tab_state() {
   local output
   output="$(browser_command tab list --json 2>/dev/null)" || return 1
-  printf '%s' "$output" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" tab-state "$OWNED_TARGET_ID" 2>/dev/null
+  ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$OWNED_TARGET_ID" "$output"
 }
 
 restore_owned_target() {
   browser_command tab "$OWNED_TARGET_ID" --json >/dev/null 2>&1
 }
 
-if ! PRE_STATE="$(read_tab_state)"; then
+if ! read_tab_state; then
   echo "✗ Could not verify the pinned target; re-run connect.sh to recover it safely." >&2
   exit 8
 fi
-PRE_ACTIVE="$(printf '%s\n' "$PRE_STATE" | sed -n '1p')"
-PRE_OWNED_PRESENT="$(printf '%s\n' "$PRE_STATE" | sed -n '2p')"
-PRE_COUNT="$(printf '%s\n' "$PRE_STATE" | sed -n '3p')"
+PRE_ACTIVE="$AB_TAB_ACTIVE"
+PRE_OWNED_PRESENT="$AB_TAB_OWNED_PRESENT"
+PRE_COUNT="$AB_TAB_COUNT"
 if [ "$PRE_ACTIVE" != "$OWNED_TARGET_ID" ]; then
   if [ "$PRE_OWNED_PRESENT" = "1" ] && restore_owned_target; then
     # The owned target still exists, so the binding is back where it belongs
@@ -217,13 +209,13 @@ fi
 COMMAND_STATUS=$?
 set -e
 
-if ! POST_STATE="$(read_tab_state)"; then
+if ! read_tab_state; then
   echo "✗ The pinned target could not be verified after the command; re-run connect.sh." >&2
   exit 9
 fi
-POST_ACTIVE="$(printf '%s\n' "$POST_STATE" | sed -n '1p')"
-POST_OWNED_PRESENT="$(printf '%s\n' "$POST_STATE" | sed -n '2p')"
-POST_COUNT="$(printf '%s\n' "$POST_STATE" | sed -n '3p')"
+POST_ACTIVE="$AB_TAB_ACTIVE"
+POST_OWNED_PRESENT="$AB_TAB_OWNED_PRESENT"
+POST_COUNT="$AB_TAB_COUNT"
 if [ "$POST_ACTIVE" != "$OWNED_TARGET_ID" ]; then
   if [ "$POST_OWNED_PRESENT" = "1" ]; then
     restore_owned_target || true

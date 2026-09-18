@@ -323,30 +323,37 @@ ab__guard_explain() {
   ab__guard_table_value "$AB_DENY_EXPLAIN" "$1"
 }
 
-# Longest allowed verb phrase, three words down to one. Prints the phrase and
-# the number of words it consumed.
+# Longest allowed verb phrase, three words down to one. Publishes the phrase as
+# AB_GUARD_VERB and the number of words it consumed as AB_GUARD_CONSUMED rather
+# than printing two lines for the caller to pick apart by position.
 ab__guard_match_verb() {
   local one="${1:-}"
   local two="${2:-}"
   local three="${3:-}"
   local phrase
 
+  AB_GUARD_VERB=""
+  AB_GUARD_CONSUMED=0
+
   if [ -n "$one" ] && [ -n "$two" ] && [ -n "$three" ]; then
     phrase="$one $two $three"
     if ab__guard_in_list "$AB_ALLOWED_VERBS" "$phrase"; then
-      printf '%s\n3\n' "$phrase"
+      AB_GUARD_VERB="$phrase"
+      AB_GUARD_CONSUMED=3
       return 0
     fi
   fi
   if [ -n "$one" ] && [ -n "$two" ]; then
     phrase="$one $two"
     if ab__guard_in_list "$AB_ALLOWED_VERBS" "$phrase"; then
-      printf '%s\n2\n' "$phrase"
+      AB_GUARD_VERB="$phrase"
+      AB_GUARD_CONSUMED=2
       return 0
     fi
   fi
   if [ -n "$one" ] && ab__guard_in_list "$AB_ALLOWED_VERBS" "$one"; then
-    printf '%s\n1\n' "$one"
+    AB_GUARD_VERB="$one"
+    AB_GUARD_CONSUMED=1
     return 0
   fi
   return 1
@@ -375,7 +382,7 @@ ab_guard_command() {
   local allow_batch="$1"
   shift
 
-  local verb_match verb consumed
+  local verb consumed
   local word flag lowered
   local verb_flags allowed_here max_positional positional
   # `|| deny_status=$?` rather than a bare call: ab__guard_deny always returns
@@ -390,7 +397,7 @@ ab_guard_command() {
 
   # A leading flag has no verb to match, so it is refused here rather than being
   # allowed to hide an ownership-changing command behind a global option.
-  if ! verb_match="$(ab__guard_match_verb "${1:-}" "${2:-}" "${3:-}")"; then
+  if ! ab__guard_match_verb "${1:-}" "${2:-}" "${3:-}"; then
     case "${1:-}" in
       -*)
         flag="${1%%=*}"
@@ -407,8 +414,8 @@ ab_guard_command() {
     ab__guard_deny "${1%% *}" "'$1'" || deny_status=$?
     return "$deny_status"
   fi
-  verb="$(printf '%s\n' "$verb_match" | sed -n '1p')"
-  consumed="$(printf '%s\n' "$verb_match" | sed -n '2p')"
+  verb="$AB_GUARD_VERB"
+  consumed="$AB_GUARD_CONSUMED"
 
   # Nested batch would let one guarded command carry a whole unguarded program.
   if [ "$verb" = "batch" ] && [ "$allow_batch" != "1" ]; then
