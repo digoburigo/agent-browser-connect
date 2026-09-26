@@ -184,6 +184,15 @@ case "$ACTION" in
       echo "WebSocket connection timed out while awaiting approval" >&2
       exit 1
     fi
+    if [ "${MOCK_MODE:-success}" = "attach-hang" ]; then
+      # An approval dialog nobody answers: the daemon blocks on it, and the CLI
+      # and any later `close` block on the daemon — as the real one does.
+      ln -sf /bin/sleep "$MOCK_STATE_DIR/agent-browser-daemon-mock"
+      "$MOCK_STATE_DIR/agent-browser-daemon-mock" 60 >/dev/null 2>&1 &
+      printf '%s\n' "$!" > "$MOCK_SOCKET_DIR/$SESSION.pid"
+      while kill -0 "$(cat "$MOCK_SOCKET_DIR/$SESSION.pid")" 2>/dev/null; do sleep 0.2; done
+      exit 1
+    fi
     if { [ "${MOCK_MODE:-success}" = "tab-gone" ] || [ "${MOCK_MODE:-success}" = "tab-gone-new-fail" ]; } \
       && [ ! -f "$REBOUND_FILE" ]; then
       echo 'Pinned target disappeared (code: tab_gone)' >&2
@@ -296,6 +305,9 @@ case "$ACTION" in
     echo "unrouted"
     ;;
   close)
+    if [ "${MOCK_MODE:-success}" = "attach-hang" ] && [ -f "$MOCK_SOCKET_DIR/$SESSION.pid" ]; then
+      while kill -0 "$(cat "$MOCK_SOCKET_DIR/$SESSION.pid")" 2>/dev/null; do sleep 0.2; done
+    fi
     if [ "${MOCK_MODE:-success}" = "close-fail" ]; then
       echo "daemon refused to stop" >&2
       exit 1
@@ -311,6 +323,22 @@ case "$ACTION" in
 esac
 MOCK
 chmod +x "$FAKE_BIN/agent-browser"
+
+# osascript stand-in for approve.js: `count` reports MOCK_OSA_COUNT open sheets
+# (or fails with MOCK_OSA_FAIL=1, like a terminal without Accessibility
+# access); `approve` records the press and reports it.
+cat > "$FAKE_BIN/osascript" <<'MOCK'
+#!/usr/bin/env bash
+printf 'osascript %q ' "$@" >> "$MOCK_LOG"
+printf '\n' >> "$MOCK_LOG"
+[ "${MOCK_OSA_FAIL:-0}" != "1" ] || { echo "execution error: not allowed assistive access (-25211)" >&2; exit 1; }
+case "${4:-}" in
+  count) echo "${MOCK_OSA_COUNT:-0}" ;;
+  approve) echo approved ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$FAKE_BIN/osascript"
 
 cat > "$FAKE_BIN/lsof" <<'MOCK'
 #!/usr/bin/env bash
@@ -349,6 +377,8 @@ run_connect() {
     MOCK_STATE_DIR="$CASE_STATE" \
     MOCK_SOCKET_DIR="$CASE_SOCKET" \
     MOCK_DAEMON_VERSION="${MOCK_DAEMON_VERSION:-}" \
+    MOCK_OSA_COUNT="${MOCK_OSA_COUNT:-0}" \
+    MOCK_OSA_FAIL="${MOCK_OSA_FAIL:-0}" \
     bash "$CONNECT" "$@"
 }
 
@@ -1027,5 +1057,228 @@ grep -q -- "tab close TARGET-SWAP" "$CASE_LOG" || fail "the empty tab from the s
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "tab-closed reason=daemon-swap"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
 pass "a daemon swap leaves no extra tab behind"
+
+# --persistent: the wrapper re-runs connect.sh by itself on a recoverable
+# failure, once per command, and then runs the command. The heal's connect needs
+# the same port and Chrome data root the first one used.
+heal_env() {
+  AB_CHROME_DATA_ROOTS="$CASE_CHROME" AB_CONNECT_PORT_ATTEMPTS=0 "$@"
+}
+
+# A dead daemon is healed, the same tab is rebound, and the command runs.
+new_case persistent-daemon
+printf '%s\n/devtools/browser/persist-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+OUTPUT="$(run_connect success "Persist case" --persistent --url http://example.test)"
+assert_text_contains "$OUTPUT" "Mode:     persistent"
+AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "persistent=1"
+rm -f "$CASE_STATE/active"
+set +e
+HEAL_OUTPUT="$(heal_env run_wrapper success "$AB" get url 2>"$CASE_DIR/heal.err")"
+HEAL_STATUS=$?
+set -e
+assert_eq "$HEAL_STATUS" "0"
+assert_eq "$HEAL_OUTPUT" "http://example.test"
+assert_file_contains "$CASE_DIR/heal.err" "persistent mode is reconnecting"
+assert_file_contains "$CASE_DIR/heal.err" "Reconnected; own tab: http://example.test"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-start reason=daemon-inactive"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-ok reason=daemon-inactive"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "attach mode=rebound (new daemon, same tab TARGET-PRIMARY)"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "persistent=1"
+TAB_NEW_CALLS="$(grep -c -- 'tab new' "$CASE_LOG" || true)"
+assert_eq "$TAB_NEW_CALLS" "0"
+[ ! -e "$CASE_ROOT/.locks/$(ab_session_lock_key "$DEFAULT_SESSION").lock" ] || fail "persistent heal leaked the session lock"
+pass "persistent mode heals a dead daemon onto the same tab"
+
+# Without --persistent the same failure still stops at exit 8 and never reconnects.
+new_case not-persistent
+printf '%s\n/devtools/browser/plain-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+run_connect success "Plain case" --url http://example.test >/dev/null
+AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "persistent=0"
+rm -f "$CASE_STATE/active"
+: > "$CASE_LOG"
+set +e
+OUTPUT="$(heal_env run_wrapper success "$AB" get url 2>&1)"
+STATUS=$?
+set -e
+assert_eq "$STATUS" "8"
+assert_text_contains "$OUTPUT" "is inactive; re-run connect.sh"
+if grep -Fq -- '--cdp' "$CASE_LOG"; then
+  fail "a non-persistent wrapper reconnected implicitly"
+fi
+pass "without --persistent the wrapper never reconnects"
+
+# A closed tab is replaced at the URL agent-browser last recorded for it.
+new_case persistent-tab-gone
+printf '%s\n/devtools/browser/persist-gone-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+run_connect success "Gone case" --persistent --session persistgone --url http://example.test >/dev/null
+AB="$CASE_ROOT/persistgone/ab"
+printf '{"targetId":"TARGET-PRIMARY","url":"http://last.test/page","pinned":true}\n' > "$CASE_SOCKET/persistgone.target"
+touch "$CASE_STATE/tab-closed"
+: > "$CASE_LOG"
+set +e
+OUTPUT="$(heal_env run_wrapper tab-gone "$AB" get url 2>"$CASE_DIR/heal.err")"
+STATUS=$?
+set -e
+assert_eq "$STATUS" "0"
+assert_eq "$OUTPUT" "http://last.test/page"
+grep -Fq -- 'tab new http://last.test/page' "$CASE_LOG" || fail "the replacement tab did not reopen at the last URL"
+assert_eq "$(grep -c -- 'tab new' "$CASE_LOG" || true)" "1"
+assert_file_contains "$CASE_ROOT/persistgone/events.log" "heal-ok reason=target-gone"
+assert_file_contains "$CASE_ROOT/persistgone/session.meta" "owned_target_id=TARGET-RECOVERED"
+pass "persistent mode replaces a closed tab at its last URL (explicit session)"
+
+# A failed heal is not retried within the cooldown, so an unapproved dialog can
+# never turn into a loop of dialogs; the rebind sidecar survives the rollback.
+new_case persistent-cooldown
+printf '%s\n/devtools/browser/persist-cool-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+run_connect success "Cooldown case" --persistent --url http://example.test >/dev/null
+AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+rm -f "$CASE_STATE/active"
+set +e
+OUTPUT="$(heal_env run_wrapper attach-fail "$AB" get url 2>&1)"
+STATUS=$?
+set -e
+assert_eq "$STATUS" "8"
+assert_text_contains "$OUTPUT" "persistent mode is reconnecting"
+assert_text_contains "$OUTPUT" "single CDP connection did not complete"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-failed reason=daemon-inactive status=5"
+[ -f "$CASE_SOCKET/$DEFAULT_SESSION.target" ] || fail "a failed heal removed the rebind sidecar"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+[ -x "$AB" ] || fail "a failed heal removed the wrapper"
+: > "$CASE_LOG"
+set +e
+OUTPUT="$(heal_env run_wrapper attach-fail "$AB" get url 2>&1)"
+STATUS=$?
+set -e
+assert_eq "$STATUS" "8"
+assert_text_contains "$OUTPUT" "cooldown"
+if grep -Fq -- '--cdp' "$CASE_LOG"; then
+  fail "a heal was retried inside the cooldown"
+fi
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-skipped"
+# Once the cooldown is over, the next command tries again and succeeds.
+set +e
+OUTPUT="$(AB_HEAL_COOLDOWN_SECONDS=0 heal_env run_wrapper success "$AB" get url 2>/dev/null)"
+STATUS=$?
+set -e
+assert_eq "$STATUS" "0"
+assert_eq "$OUTPUT" "http://example.test"
+pass "a failed heal waits out the cooldown and never loops"
+
+# A heal that waits on an unanswered dialog is stopped by the timeout, well
+# before agent-browser's own ~5-minute give-up, and leaves the wrapper usable.
+new_case persistent-timeout
+printf '%s\n/devtools/browser/persist-timeout-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+run_connect success "Timeout case" --persistent --url http://example.test >/dev/null
+AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+rm -f "$CASE_STATE/active"
+STARTED_AT="$(date +%s)"
+set +e
+OUTPUT="$(AB_HEAL_TIMEOUT_SECONDS=2 heal_env run_wrapper attach-hang "$AB" get url 2>&1)"
+STATUS=$?
+set -e
+ELAPSED=$(( $(date +%s) - STARTED_AT ))
+assert_eq "$STATUS" "8"
+assert_text_contains "$OUTPUT" "No connection within 2s"
+[ "$ELAPSED" -lt 15 ] || fail "the heal timeout did not stop the attach (took ${ELAPSED}s)"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-failed reason=daemon-inactive"
+# The rollback ran to completion: the owned target survived in session.meta and
+# no backup was left behind, which only happens if the blocked daemon was stopped.
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+if ls "$CASE_ROOT/$DEFAULT_SESSION/" | grep -q backup; then
+  fail "a timed-out heal left rollback backups behind"
+fi
+if kill -0 "$(cat "$CASE_SOCKET/$DEFAULT_SESSION.pid")" 2>/dev/null; then
+  fail "the daemon blocked on the dialog survived the timeout"
+fi
+[ -f "$CASE_SOCKET/$DEFAULT_SESSION.target" ] || fail "a timed-out heal removed the rebind sidecar"
+[ -x "$AB" ] || fail "a timed-out heal removed the wrapper"
+[ ! -e "$CASE_ROOT/.locks/$(ab_session_lock_key "$DEFAULT_SESSION").lock" ] || fail "a timed-out heal leaked the session lock"
+pass "an unanswered approval dialog times the heal out"
+
+# --auto-approve presses Chrome's sheet only around the attach, is remembered
+# for heals, and stands down when a dialog was already open or access is missing.
+if [ "$(uname -s)" = "Darwin" ]; then
+  new_case auto-approve
+  printf '%s\n/devtools/browser/approve-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+  OUTPUT="$(run_connect success "Approve case" --persistent --auto-approve --url http://example.test 2>&1)"
+  assert_text_contains "$OUTPUT" "Approved Chrome's remote-debugging prompt for this connection"
+  assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "auto_approve=1"
+  assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "auto-approved"
+  # count before approve, and approve before the attach finished.
+  COUNT_LINE="$(grep -n 'osascript.* count ' "$CASE_LOG" | head -1 | cut -d: -f1)"
+  APPROVE_LINE="$(grep -n 'osascript.* approve ' "$CASE_LOG" | head -1 | cut -d: -f1)"
+  [ -n "$COUNT_LINE" ] && [ -n "$APPROVE_LINE" ] && [ "$COUNT_LINE" -lt "$APPROVE_LINE" ] \
+    || fail "the approver did not check for an already-open dialog first"
+  # A heal re-runs connect with --auto-approve.
+  AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+  rm -f "$CASE_STATE/active"
+  MOCK_LSOF_LIVE=1 MOCK_PORT="$PORT" heal_env run_wrapper success "$AB" get url >/dev/null 2>&1 || fail "auto-approve heal failed"
+  assert_eq "$(grep -c 'auto-approved' "$CASE_ROOT/$DEFAULT_SESSION/events.log")" "2"
+  pass "auto-approve presses the sheet during the attach and survives a heal"
+
+  # A live daemon whose socket to Chrome dropped redials on the next call; the
+  # approver covers that call. With the socket up, no approver runs at all.
+  : > "$CASE_LOG"
+  MOCK_LSOF_LIVE=1 MOCK_PORT="$PORT" run_wrapper success "$AB" get url >/dev/null 2>&1 || fail "wrapped command failed"
+  if grep -q 'osascript' "$CASE_LOG"; then
+    fail "the approver ran although the daemon's socket was up"
+  fi
+  MOCK_LSOF_LIVE=0 MOCK_PORT="$PORT" run_wrapper success "$AB" get url >/dev/null 2>&1 || fail "wrapped command failed"
+  grep -q 'osascript.* approve ' "$CASE_LOG" || fail "the approver did not cover the daemon's redial"
+  assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "socket-down pid=4242"
+  pass "auto-approve covers a dropped socket's redial and nothing else"
+
+  new_case auto-approve-foreign
+  printf '%s\n/devtools/browser/approve-foreign-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+  OUTPUT="$(MOCK_OSA_COUNT=1 run_connect success "Foreign case" --auto-approve --url http://example.test 2>&1)"
+  assert_text_contains "$OUTPUT" "already open before this connection"
+  if grep -q 'osascript.* approve ' "$CASE_LOG"; then
+    fail "auto-approve pressed a dialog that was open before the attach"
+  fi
+  assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "auto-approve-skipped reason=dialog-already-open"
+  pass "auto-approve never answers a dialog that was already open"
+
+  new_case auto-approve-denied
+  printf '%s\n/devtools/browser/approve-denied-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+  OUTPUT="$(MOCK_OSA_FAIL=1 run_connect success "Denied case" --auto-approve --url http://example.test 2>&1)"
+  assert_text_contains "$OUTPUT" "Accessibility access"
+  assert_text_contains "$OUTPUT" "Own tab:  http://example.test"
+  pass "without Accessibility access auto-approve falls back to the manual dialog"
+fi
+
+# A refused command never triggers a heal: the guard runs first.
+new_case persistent-guard
+printf '%s\n/devtools/browser/persist-guard-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+run_connect success "Guard case" --persistent --url http://example.test >/dev/null
+AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+rm -f "$CASE_STATE/active"
+: > "$CASE_LOG"
+set +e
+OUTPUT="$(heal_env run_wrapper success "$AB" tab new http://x.test 2>&1)"
+STATUS=$?
+set -e
+assert_eq "$STATUS" "2"
+assert_file_not_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-start"
+assert_eq "$(wc -l < "$CASE_LOG" | tr -d ' ')" "0"
+pass "a refused command never triggers a heal"
+
+# The sidecar URL reader prints only URLs safe to hand `tab new`.
+for SIDECAR_CASE in \
+  '{"url":"https://a.test/x?y=1"}|https://a.test/x?y=1' \
+  '{"url":"about:blank"}|about:blank' \
+  '{"url":"javascript:alert(1)"}|' \
+  '{"url":"file:///etc/passwd"}|' \
+  '{"url":"-https://a.test"}|' \
+  'binding|'; do
+  SIDECAR_INPUT="${SIDECAR_CASE%%|*}"
+  SIDECAR_WANT="${SIDECAR_CASE#*|}"
+  SIDECAR_GOT="$(printf '%s' "$SIDECAR_INPUT" | node "$SKILL_DIR/scripts/json.mjs" target-url)"
+  assert_eq "$SIDECAR_GOT" "$SIDECAR_WANT"
+done
+pass "sidecar URL reader rejects unsafe replacement URLs"
 
 printf '\nAll agent-browser-connect helper tests passed.\n'

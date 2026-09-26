@@ -259,9 +259,25 @@ ab_normalize_port() {
   printf '%s' "$normalized"
 }
 
-ab_wrapper_root() {
+# Where wrappers and session.meta live. Not $TMPDIR: macOS purges it (at reboot
+# and on its own schedule), and a purged root deletes the wrapper an agent is
+# still calling, which is a lost connection no dispatcher can heal. The cache
+# directory survives both, so a --persistent session can still reconnect after
+# a reboot.
+ab_default_wrapper_root() {
   local tmp="${TMPDIR:-/tmp}"
-  local root="${AB_CONNECT_ROOT:-${tmp%/}/agent-browser-connect}"
+  if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+    printf '%s/agent-browser-connect' "${tmp%/}"
+    return
+  fi
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin) printf '%s/Library/Caches/agent-browser-connect' "${HOME%/}" ;;
+    *) printf '%s/agent-browser-connect' "${XDG_STATE_HOME:-${HOME%/}/.local/state}" ;;
+  esac
+}
+
+ab_wrapper_root() {
+  local root="${AB_CONNECT_ROOT:-$(ab_default_wrapper_root)}"
   while [ "$root" != "/" ] && [ "${root%/}" != "$root" ]; do
     root="${root%/}"
   done
@@ -609,4 +625,57 @@ ab_load_meta() {
     return 1
   fi
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# --auto-approve: press "Allow" on Chrome's "Allow remote debugging?" sheet
+# (scripts/approve.js, macOS Accessibility API) for ONE connection this skill
+# is about to open. Callers start it immediately before the command that dials
+# Chrome and stop it immediately after, so it never outlives that window, and
+# approve.js presses at most once. A sheet already open before the start belongs
+# to some other client: its presence switches auto-approval off instead.
+# Publishes AB_APPROVER_PID. Never fails the caller: at worst the user approves
+# by hand, as without the flag.
+# ---------------------------------------------------------------------------
+AB_APPROVER_PID=""
+ab_start_approver() {
+  local dir="$1"
+  local script_dir="$2"
+  local app="${AB_APPROVE_APP:-Google Chrome}"
+  local title="${AB_APPROVE_TITLE:-Allow remote debugging?}"
+  local button="${AB_APPROVE_BUTTON:-Allow}"
+  local open_sheets
+  AB_APPROVER_PID=""
+  if [ "$(uname -s 2>/dev/null || true)" != "Darwin" ] || ! command -v osascript >/dev/null 2>&1; then
+    echo "! --auto-approve needs macOS osascript; approve Chrome's dialog by hand." >&2
+    return 0
+  fi
+  if ! open_sheets="$(osascript -l JavaScript "$script_dir/approve.js" count "$app" "$title" "$button" 2>"$dir/approve.err")"; then
+    echo "! --auto-approve could not read $app's windows (grant this terminal Accessibility access in System Settings › Privacy & Security); approve the dialog by hand." >&2
+    [ ! -s "$dir/approve.err" ] || sed 's/^/  /' "$dir/approve.err" >&2
+    rm -f "$dir/approve.err"
+    return 0
+  fi
+  rm -f "$dir/approve.err"
+  if [ "$open_sheets" != "0" ]; then
+    ab_log_event "$dir" auto-approve-skipped "reason=dialog-already-open count=$open_sheets"
+    echo "! A remote-debugging dialog was already open before this connection; it is not this session's, so it is left for you to answer." >&2
+    return 0
+  fi
+  osascript -l JavaScript "$script_dir/approve.js" approve "$app" "$title" "$button" "${AB_APPROVE_SECONDS:-120}" \
+    >"$dir/approve.out" 2>/dev/null &
+  AB_APPROVER_PID=$!
+}
+
+ab_stop_approver() {
+  local dir="$1"
+  [ -n "${AB_APPROVER_PID:-}" ] || return 0
+  kill "$AB_APPROVER_PID" 2>/dev/null || true
+  wait "$AB_APPROVER_PID" 2>/dev/null || true
+  AB_APPROVER_PID=""
+  if [ -f "$dir/approve.out" ] && grep -qx 'approved' "$dir/approve.out"; then
+    ab_log_event "$dir" auto-approved "app=${AB_APPROVE_APP:-Google Chrome}"
+    echo "✓ Approved Chrome's remote-debugging prompt for this connection (--auto-approve)." >&2
+  fi
+  rm -f "$dir/approve.out"
 }

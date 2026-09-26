@@ -1,6 +1,6 @@
 ---
 name: agent-browser-connect
-description: Drive the user's already-open Chrome with agent-browser through an owner-pinned wrapper. Use for any browser task (open, click, fill, screenshot, scrape, QA, React render profiling, localhost checks) and whenever a browser session drifted, reported tab_gone, or several agents share one Chrome. Replaces headless browsers and Playwright.
+description: Drive the user's already-open Chrome with agent-browser through an owner-pinned wrapper. Use for any browser task (open, click, fill, screenshot, scrape, QA, React render profiling, localhost checks) and whenever a browser session drifted, reported tab_gone, keeps losing its connection, or several agents share one Chrome. Replaces headless browsers and Playwright.
 allowed-tools: Bash(agent-browser:*), Bash(bash:*), Bash(npx agent-browser:*)
 ---
 
@@ -43,6 +43,21 @@ that exports none of them, export `AB_CONNECT_ID` once or pass `--session <id>`.
 Done when the script prints the wrapper path and the session name. Copy the exact path
 it printed; write it out in full on every call, since shell variables do not survive
 between tool calls. Chrome may show one approval dialog on the first connection.
+
+### Persistent sessions
+
+Add `--persistent` when the session has to outlive trouble: a long QA pass, profiling,
+anything the user expects to keep running. The wrapper then heals by itself — a dead
+daemon, a closed tab, a Chrome restart, an agent-browser upgrade — by re-running this
+connect once and running your command. A line starting `! ... persistent mode is
+reconnecting` is that heal; the command's output follows it, so carry on. A closed tab
+comes back as a new foreground tab at its last URL without the query string, so
+re-navigate if the query mattered.
+
+Add `--auto-approve` when the user asks for it: it presses Chrome's "Allow remote
+debugging?" button for this skill's own connections only (macOS, Accessibility access
+for the terminal). With both flags a session reconnects with no click at all. Both are
+remembered for the session's heals; re-running connect without them turns them off.
 
 ## 2. Load the CLI reference, then work through the wrapper
 

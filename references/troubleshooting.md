@@ -56,8 +56,13 @@ Keep using the existing Chrome rather than launching a substitute.
 | Commands reach the wrong page | A bare agent-browser command bypassed the guard | Return to the wrapper. `tab list` is the only public tab-management operation it permits. |
 | Chrome keeps switching between two agents' tabs | Something brought a tab to the front: a fresh connect (new tabs open in the foreground), a `tab_gone` recovery, a drift restore (`tab <id>` always sends `Page.bringToFront`), or a bare `bringtofront` | Read `events.log` in each agent's wrapper directory (the path `connect.sh` printed, minus `/ab`). Zero `drift-restored` lines means the wrapper is not the cause; look for bare `agent-browser` calls or repeated reconnects. `cleanup.sh` prints the same counts and archives the log under `<wrapper root>/.history/`. |
 | A second Chrome window appeared and stayed after the task | `record start` ran on the session (through a wrapper older than 2026-09-04, or bare). It creates a new browser context, which Chrome shows as its own window, and `record stop` does not close it | Close that window by hand. The wrapper now rejects `record`; use `screenshot` for stills, or `trace start|stop` / `profiler start|stop` to capture what happened. A fresh attach can also land in a new window when Chrome has no normal window open for the default profile; that one is Chrome's placement rule, not the skill |
+| `! ... persistent mode is reconnecting` followed by the command's output | A `--persistent` session healed: its daemon died, its tab closed, Chrome restarted or agent-browser was upgraded | Nothing to do. `events.log` records `heal-start` / `heal-ok`. A closed tab came back in the foreground at its last URL minus the query string. |
+| `persistent mode did not reconnect: the last attempt failed Ns ago` | A heal failed less than `AB_HEAL_COOLDOWN_SECONDS` (60) ago, and retrying now could stack another approval dialog | Look at Chrome for an unanswered dialog, then re-run connect by hand or wait out the cooldown; the next command after it tries again. |
+| `No connection within 90s: Chrome is most likely still showing its approval dialog` | A heal waited `AB_HEAL_TIMEOUT_SECONDS` for approval. The waiting daemon was stopped (its rollback would otherwise block too), so that dialog is stale | Ask the user to cancel the stale dialog. The next command after the cooldown reconnects; with `--auto-approve` it needs no click. |
+| `--auto-approve could not read Google Chrome's windows` | The terminal running the agent lacks the macOS Accessibility permission, so `approve.js` cannot see the sheet | Ask the user to allow the terminal app (Ghostty, iTerm, …) under System Settings › Privacy & Security › Accessibility. Until then the dialog is approved by hand; nothing else changes. |
+| `A remote-debugging dialog was already open before this connection` | Another client's approval was pending when this connect started. The sheet does not say whose it is, so auto-approve leaves it alone | The user answers it by hand. This session's own dialog may be stacked behind it. |
 | `Ref not found: @eN` | The page changed after a snapshot | Run `bash <wrapper> snapshot -i` again and use fresh refs. |
-| Chrome restarted | The exact browser WebSocket changed | Re-run connect for the same owner/slot or explicit session. |
+| Chrome restarted | The exact browser WebSocket changed | Re-run connect for the same owner/slot or explicit session (a `--persistent` session does this by itself). |
 | `agent-browser was upgraded (X → Y)` from the wrapper, exit 8 | A live session is still held by a daemon running the previous version | Re-run `connect.sh`. It stops the stale daemon and attaches once with the current version, keeping the same tab. Never work around it by calling `agent-browser` directly: the restart that a browser command triggers drops the CDP attachment and can launch a substitute Chrome (reproduced 2026-09-16, 0.37.1 → 0.38.0, `⚠ Daemon version mismatch detected, restarting...` followed by `[agent-browser] launched browser` and a full Chrome for Testing process tree). |
 | Unexpected behavior after an upgrade | Daemon or socket state may be stale | Re-run `connect.sh` for each session you own, then `agent-browser doctor`; add `--fix` only when it recommends doing so. |
 | Every new session times out while the port remains open | Too many browser-attached daemons may be active | Inspect and close only sessions proven stale. |
@@ -100,6 +105,14 @@ Run these from the skill directory. The gated integration suite launches the ins
 AB_RUN_REAL_CHROME=1 bash tests/real-chrome.sh
 AB_RUN_REAL_CHROME=1 AB_REAL_CHROME_HEADLESS=0 bash tests/real-chrome.sh  # visible disposable window
 ```
+
+## Where session state lives
+
+Wrappers, `session.meta` and `events.log` live under `~/Library/Caches/agent-browser-connect`
+on macOS and `${XDG_STATE_HOME:-~/.local/state}/agent-browser-connect` elsewhere
+(`AB_CONNECT_ROOT` overrides). Until 2026-09-25 they lived in `$TMPDIR`, which macOS purges;
+a purged root deleted the wrapper an agent was still calling. Sessions connected before that
+date still use their `$TMPDIR` wrapper until they are cleaned up and connected again.
 
 ## Stale daemons
 

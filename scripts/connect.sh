@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 usage() {
-  echo "usage: connect.sh [label] [--url <url>] [--port 9222] [--session <existing>] [--slot <name>] [--react]" >&2
+  echo "usage: connect.sh [label] [--url <url>] [--port 9222] [--session <existing>] [--slot <name>] [--react] [--persistent] [--auto-approve]" >&2
 }
 
 die_usage() {
@@ -23,13 +23,19 @@ URL=""
 REUSE="${AB_SESSION_ID:-}"
 SLOT="default"
 REACT_HOOK=0
+PERSISTENT=0
+AUTO_APPROVE=0
+# Internal: the dispatcher passes the URL a closed tab last had, so a persistent
+# heal reopens it there. Unlike --url it never navigates a tab that survived.
+REPLACE_URL=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --url|--port|--session|--slot)
+    --url|--port|--session|--slot|--replace-url)
       [ "$#" -ge 2 ] || die_usage "$1 requires a value"
       case "$1" in
         --url) URL="$2" ;;
+        --replace-url) REPLACE_URL="$2" ;;
         --port) PORT_RAW="$2" ;;
         --session) REUSE="$2" ;;
         --slot) SLOT="$2" ;;
@@ -38,6 +44,14 @@ while [ "$#" -gt 0 ]; do
       ;;
     --react)
       REACT_HOOK=1
+      shift
+      ;;
+    --persistent)
+      PERSISTENT=1
+      shift
+      ;;
+    --auto-approve)
+      AUTO_APPROVE=1
       shift
       ;;
     -h|--help)
@@ -61,6 +75,10 @@ done
 
 case "$URL" in
   -*) die_usage "URL values may not begin with '-'" ;;
+esac
+case "$REPLACE_URL" in
+  ''|about:blank|http://*|https://*) ;;
+  *) die_usage "--replace-url must be an http(s) URL or about:blank" ;;
 esac
 
 # The React DevTools hook is an init script registered ONCE, when the daemon
@@ -172,6 +190,9 @@ case "$ROOT" in
     ;;
 esac
 
+# The default root sits in a cache directory that may not exist yet; only the
+# root itself has to be private, its parents are ordinary user directories.
+mkdir -p "$(dirname "$ROOT")" 2>/dev/null || true
 if ! ab_prepare_private_dir "$ROOT"; then
   echo "✗ Wrapper root is not a private directory owned by this user: $ROOT" >&2
   exit 5
@@ -270,6 +291,15 @@ if [ -f "$META" ]; then
   fi
 fi
 
+# --auto-approve: see ab_start_approver in lib.sh. Scoped to this attach.
+start_approver() {
+  [ "$AUTO_APPROVE" -eq 1 ] || return 0
+  ab_start_approver "$DIR" "$SCRIPT_DIR"
+}
+stop_approver() {
+  ab_stop_approver "$DIR"
+}
+
 COMMITTED=0
 ATTACH_ESTABLISHED=0
 TARGET_DISCOVERY_SAFE=0
@@ -278,6 +308,7 @@ rollback() {
   local status=$?
   local rollback_list rollback_state rollback_target
   trap - EXIT INT TERM
+  stop_approver
   rm -f "$DIR/attach.err" "$DIR/navigation.err" "$DIR/target.err" "$DIR/rebind.err" "$DIR/ab.tmp.$$" 2>/dev/null || true
 
   if [ "$COMMITTED" -eq 0 ]; then
@@ -289,14 +320,22 @@ rollback() {
           && ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "" "$rollback_list"; then
           rollback_target="$AB_TAB_ACTIVE"
         fi
-        if [ -n "$rollback_target" ] && [[ "$rollback_target" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        if [ -n "$rollback_target" ] && [ "$rollback_target" = "$PREV_OWNED_TARGET_ID" ]; then
+          # The attach rebound to the tab this session already owned (a re-run
+          # after the daemon died, or a persistent heal). That tab holds the
+          # user's page state; a failed re-attach must not close it.
+          :
+        elif [ -n "$rollback_target" ] && [[ "$rollback_target" =~ ^[A-Za-z0-9_-]+$ ]]; then
           "$AGENT_BROWSER_BIN" --session "$SESSION" tab close "$rollback_target" >/dev/null 2>&1 || true
         else
           echo "! Failed attach left no provable target ID; rollback preserved all Chrome targets." >&2
         fi
       fi
       "$AGENT_BROWSER_BIN" --session "$SESSION" close >/dev/null 2>&1 || true
-      ab_remove_session_files "$SOCKET_DIR" "$SESSION" || true
+      # With a previously owned tab, the `<session>.target` sidecar is what lets
+      # the next attempt rebind that same tab instead of opening another one;
+      # keep it, as the version-swap path does.
+      [ -n "$PREV_OWNED_TARGET_ID" ] || ab_remove_session_files "$SOCKET_DIR" "$SESSION" || true
     fi
 
     if [ "$DIR_EXISTED" -eq 0 ]; then
@@ -349,6 +388,11 @@ done
   printf 'socket_dir=%s\n' "$SOCKET_DIR"
   printf 'owned_target_id=\n'
   printf 'created_at=%s\n' "$CREATED_AT"
+  # Read by dispatch.sh: persistent=1 lets the wrapper re-run this script by
+  # itself on a recoverable failure, and react=1 makes that re-run pass --react.
+  printf 'persistent=%s\n' "$PERSISTENT"
+  printf 'react=%s\n' "$REACT_HOOK"
+  printf 'auto_approve=%s\n' "$AUTO_APPROVE"
 } > "$META"
 chmod 600 "$META"
 
@@ -360,8 +404,9 @@ browser_command() {
   "$AGENT_BROWSER_BIN" --cdp "$CDP_URL" --pin-tab --session "$SESSION" "$@"
 }
 
-TARGET="${URL:-about:blank}"
+TARGET="${URL:-${REPLACE_URL:-about:blank}}"
 ATTACH_ERROR=""
+start_approver
 if BOUND="$(browser_command get url 2>"$DIR/attach.err")"; then
   ATTACH_ESTABLISHED=1
   TARGET_DISCOVERY_SAFE=1
@@ -387,7 +432,9 @@ else
     fi
     if [ "$TARGET_DISCOVERY_SAFE" -eq 1 ] \
       && BOUND="$(browser_command get url 2>"$DIR/attach.err")"; then
-      :
+      # Read right after `tab new`, the URL is still about:blank while the
+      # replacement loads; report where it is going, not the blank moment.
+      [ "${BOUND//$'\r'/}" != "about:blank" ] || [ "$TARGET" = "about:blank" ] || BOUND="$TARGET (loading)"
     else
       ATTACH_ERROR="$(cat "$DIR/attach.err" 2>/dev/null || true)"
       echo "✗ Reconnected to Chrome but could not replace the closed pinned tab." >&2
@@ -430,6 +477,7 @@ MSG
     exit 5
   fi
 fi
+stop_approver
 rm -f "$DIR/attach.err"
 
 BOUND="${BOUND//$'\r'/}"
@@ -442,9 +490,11 @@ if [ "${STALE_DAEMON_SWAPPED:-0}" -eq 1 ]; then
   # so the replacement rebinds to the same tab instead of opening another one.
   ab_log_event "$DIR" attach "mode=reattach-after-upgrade (rebound to the persisted target)"
 elif [ "$SESSION_WAS_ACTIVE" -eq 0 ]; then
-  # A pinned session never adopts an existing tab, so the daemon opened a new
-  # one during this attach, and Chrome shows new targets in the foreground.
-  ab_log_event "$DIR" attach "mode=fresh (daemon opened a new foreground tab)"
+  # Logged once the bound target is known: a new daemon for a session that
+  # already owned a tab rebinds it through the `<session>.target` sidecar
+  # (measured 2026-09-25 on 0.38.1 after a killed daemon), and only a first
+  # attach opens a new foreground tab.
+  ATTACH_LOG_PENDING=1
 else
   ab_log_event "$DIR" attach "mode=reused"
 fi
@@ -527,6 +577,13 @@ if ! ab_set_meta_value "$META" owned_target_id "$OWNED_TARGET_ID"; then
   echo "✗ Connected, but could not persist the owned target safely." >&2
   exit 5
 fi
+if [ "${ATTACH_LOG_PENDING:-0}" -eq 1 ]; then
+  if [ -n "$PREV_OWNED_TARGET_ID" ] && [ "$OWNED_TARGET_ID" = "$PREV_OWNED_TARGET_ID" ]; then
+    ab_log_event "$DIR" attach "mode=rebound (new daemon, same tab $OWNED_TARGET_ID)"
+  else
+    ab_log_event "$DIR" attach "mode=fresh (daemon opened a new foreground tab)"
+  fi
+fi
 
 REACT_STATUS=""
 if [ "$REACT_HOOK" -eq 1 ]; then
@@ -589,6 +646,15 @@ INFO
 INFO
       ;;
   esac
+fi
+
+if [ "$PERSISTENT" -eq 1 ]; then
+  cat <<INFO
+✓ Mode:     persistent. When the daemon dies, the owned tab closes, Chrome restarts
+            or agent-browser is upgraded, the wrapper re-runs this connect by itself
+            (at most once per command, never again within ${AB_HEAL_COOLDOWN_SECONDS:-60}s of a failed try) and
+            then runs the command. Chrome may ask to approve that one connection.
+INFO
 fi
 
 cat <<INFO

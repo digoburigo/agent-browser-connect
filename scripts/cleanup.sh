@@ -216,6 +216,9 @@ if [ -f "$DIR/events.log" ] && [ ! -L "$DIR/events.log" ]; then
     END {
       printf "attach=%d tab-new=%d drift-restored=%d target-gone=%d page-count-grew=%d",
         counts["attach"], counts["tab-new"], counts["drift-restored"], counts["target-gone"], counts["page-count-grew"]
+      if (counts["heal-start"] + counts["heal-skipped"] > 0)
+        printf " heal-ok=%d heal-failed=%d heal-skipped=%d",
+          counts["heal-ok"], counts["heal-failed"], counts["heal-skipped"]
     }' "$DIR/events.log" 2>/dev/null || true)"
   HISTORY_DIR="$ROOT/.history"
   if ab_prepare_private_dir "$HISTORY_DIR"; then

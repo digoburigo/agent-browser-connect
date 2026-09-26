@@ -5,7 +5,7 @@ const readStdin = async () => {
   for await (const chunk of process.stdin) {
     chunks.push(chunk);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks).toString("utf-8");
 };
 
 const fail = (message, code = 1) => {
@@ -22,7 +22,7 @@ const parseInput = (input) => {
 };
 
 const splitShellWords = (input) => {
-  if (/[\u001f\r\n]/u.test(input)) {
+  if (/[\u001F\r\n]/u.test(input)) {
     fail("batch command contains an unsafe control character");
   }
   const words = [];
@@ -66,7 +66,7 @@ const command = process.argv[2];
 const expected = process.argv[3] ?? "";
 const input = await readStdin();
 if (command === "batch-argument") {
-  process.stdout.write(`${splitShellWords(input).join("\u001f")}\n`);
+  process.stdout.write(`${splitShellWords(input).join("\u001F")}\n`);
   process.exit(0);
 }
 if (command === "batch-encode") {
@@ -79,7 +79,7 @@ if (command === "batch-encode") {
   const commands = input
     .split("\n")
     .filter((line) => line.length > 0)
-    .map((line) => line.split("\u001f"));
+    .map((line) => line.split("\u001F"));
   if (commands.length === 0) {
     fail("batch-encode received no commands");
   }
@@ -87,11 +87,35 @@ if (command === "batch-encode") {
   process.exit(0);
 }
 
+if (command === "target-url") {
+  // agent-browser's `<session>.target` sidecar: {"targetId","url","pinned"}. A
+  // persistent heal reopens a closed tab at the URL it last had, so only a URL
+  // that is safe to hand `tab new` is printed; anything else prints nothing and
+  // the replacement opens at about:blank.
+  let sidecar;
+  try {
+    sidecar = JSON.parse(input);
+  } catch {
+    process.exit(0);
+  }
+  const url = typeof sidecar?.url === "string" ? sidecar.url : "";
+  if (
+    url.length <= 2048 &&
+    !/[\s\u0000-\u001F]/u.test(url) &&
+    (/^https?:\/\/[^\s]+$/u.test(url) || url === "about:blank")
+  ) {
+    process.stdout.write(`${url}\n`);
+  }
+  process.exit(0);
+}
+
 const payload = parseInput(input);
 
 if (
   command !== "batch-stdin" &&
-  (payload?.success !== true || typeof payload.data !== "object" || payload.data === null)
+  (payload?.success !== true ||
+    typeof payload.data !== "object" ||
+    payload.data === null)
 ) {
   fail("agent-browser JSON did not report success");
 }
@@ -123,8 +147,12 @@ if (command === "session-info") {
   // leaves an older daemon holding the session, and the next browser command
   // restarts it; connect and dispatch compare this against the CLI on PATH so
   // that restart never happens mid-command.
-  const versionValue = payload.data.version ?? payload.data.runtime?.version ?? "";
-  const version = typeof versionValue === "string" ? validateString(versionValue, "version") : "";
+  const versionValue =
+    payload.data.version ?? payload.data.runtime?.version ?? "";
+  const version =
+    typeof versionValue === "string"
+      ? validateString(versionValue, "version")
+      : "";
   // Named fields, not bare lines in a fixed order: three shell scripts read this
   // and a reordering here used to corrupt all of them silently.
   process.stdout.write(
@@ -150,7 +178,9 @@ if (command === "tab-state") {
       : "";
   let expectedPresent = "0";
   if (expected) {
-    expectedPresent = tabs.some((tab) => tab?.targetId === expected) ? "1" : "0";
+    expectedPresent = tabs.some((tab) => tab?.targetId === expected)
+      ? "1"
+      : "0";
   }
   process.stdout.write(
     `active_target=${activeTarget}\nowned_present=${expectedPresent}\ncount=${tabs.length}\n`
@@ -171,12 +201,12 @@ if (command === "batch-stdin") {
     }
     return entry
       .map((word) => {
-        if (typeof word !== "string" || /[\u001f\r\n]/u.test(word)) {
+        if (typeof word !== "string" || /[\u001F\r\n]/u.test(word)) {
           fail(`batch command ${index} contains a non-string or unsafe word`);
         }
         return word;
       })
-      .join("\u001f");
+      .join("\u001F");
   });
   process.stdout.write(`${lines.join("\n")}\n`);
   process.exit(0);

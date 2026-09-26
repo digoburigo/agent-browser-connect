@@ -25,7 +25,7 @@ approval mode prompts again. Since 0.38 the replaced socket is closed rather tha
 stranded (upstream #1739), so the cost is the dialog, not an accumulating pile. `connect.sh` checks raw TCP, reads the
 matching `DevToolsActivePort` file without opening a WebSocket, and hands agent-browser
 the exact URL. It attaches once and does not retry blindly; a repeated dialog means
-another process is reconnecting. Last verified against agent-browser 0.38.0 (2026-09-16).
+another process is reconnecting. `--persistent` is the one bounded exception (see below). Last verified against agent-browser 0.38.0 (2026-09-16).
 
 ## Version mismatch after an upgrade
 
@@ -53,6 +53,80 @@ where they already inspect the session:
   sometimes times out; failing would leave the user with no session at all.
 
 An empty version on either side disables the check; it never guesses a mismatch.
+
+## Persistent mode: bounded self-healing
+
+Without `--persistent`, every lost connection stops at exit 8 and the agent re-runs
+connect. That stays the default because a reconnect can cost an approval dialog, and an
+implicit loop of them is worse than a visible failure. `--persistent` makes the dispatcher
+run that same re-run itself, under three bounds:
+
+- **Once per command.** `dispatch.sh` turns its pre-command checks into `preflight`, which
+  records a `HEAL_REASON` instead of exiting. Only these heal: `daemon-inactive`,
+  `session-info-failed`, `version-mismatch`, `tab-list-failed` (what a Chrome restart looks
+  like: the recorded WebSocket is gone), `target-gone` and `no-owned-target`. A guard refusal,
+  unsafe metadata, a lock timeout and every post-command check never heal. The command ran,
+  and running it twice is not safe.
+- **A cooldown after failure.** `heal.state` holds the last attempt. For
+  `AB_HEAL_COOLDOWN_SECONDS` (60) after a failed heal, no heal is tried, so an unanswered
+  dialog cannot turn into a stack of them.
+- **A timeout.** agent-browser's CLI waits about five minutes for an unanswered approval
+  before giving up ("Failed to read ... after 5 retries", measured 2026-09-25 on 0.38.1), far
+  longer than an agent's command timeout. The heal runs connect in its own process group and
+  a watchdog stops it after `AB_HEAL_TIMEOUT_SECONDS` (90). The order matters: while the
+  daemon waits on the dialog, connect's rollback `close` blocks on the daemon too. So the
+  watchdog kills that session's daemon first (proven by its pid file and process name), then
+  TERMs connect, whose rollback finishes and restores `session.meta`.
+
+The heal hands the session lock to connect and takes it back. It passes the recorded owner
+(`AB_CONNECT_ID`, or `--session` for `explicit:` owners), slot, port, `--react` and
+`--auto-approve`, so the re-run lands on the same session. For a closed tab it also passes
+`--replace-url`: the URL from agent-browser's `<session>.target` sidecar, which the CLI
+rewrites after every command but sanitizes (the query string is dropped). `json.mjs
+target-url` accepts only http(s) or `about:blank`.
+
+What was measured live on 2026-09-25 (agent-browser 0.38.1):
+
+| Loss | Recovery |
+|---|---|
+| Socket dropped, daemon alive | The daemon redials by itself on the next call: one dialog, same tab. The skill does nothing. |
+| Daemon killed | A new daemon rebinds the same tab through the sidecar; no new tab. `attach mode=rebound` in `events.log`. |
+| Owned tab closed | `tab new` on the live connection: no dialog, one foreground tab. |
+| Heal with nobody approving | Timed out, daemon stopped, meta and sidecar intact. |
+
+Two rollback rules exist for heals, and they also protect a hand re-run after a dead daemon.
+A failed re-attach never closes the tab the session already owned, and it keeps the
+`.target` sidecar, so the next attempt rebinds instead of opening a tab.
+
+Chrome quitting is the one loss nothing heals. A heal waits connect's usual 30 s for the
+port, fails and cools down.
+
+## Auto-approve: pressing Chrome's dialog
+
+Chrome has no way to remember an approval. The upstream request (chrome-devtools-mcp #825)
+was closed as not planned, and the `RemoteDebuggingAllowed` policy only switches remote
+debugging on or off. Since Chrome 136 the default profile also ignores
+`--remote-debugging-port`, which is the approval-free path. So `--auto-approve` presses the
+button through the macOS Accessibility API (`scripts/approve.js`, JXA via `osascript`;
+`AXPress` acts without focusing Chrome). Recorded 2026-09-25: the prompt is an `AXSheet`
+titled "Allow remote debugging?" on a browser window, holding the buttons "Turn off in
+settings", "Cancel" and "Allow". Titles are overridable (`AB_APPROVE_APP`,
+`AB_APPROVE_TITLE`, `AB_APPROVE_BUTTON`) for other Chromium browsers or locales.
+
+**The sheet names no client**, so any process that dials 9222 while the approver runs gets
+approved too. The time window is the only scope there is, and it is kept small:
+
+- It runs only around a connection this session opens: connect's attach, and, in the
+  dispatcher, the one call after `lsof` shows the daemon has no established socket (the
+  redial case). It is never a background clicker.
+- It presses at most once, then exits; the caller kills it when the command returns.
+- A sheet already open before it starts belongs to someone else, so auto-approve stands
+  down (`auto-approve-skipped`) and the user answers by hand.
+- It is opt-in per session, because it trades a security prompt for convenience and that
+  trade is the user's to make.
+
+Measured: connect with a dead daemon approved and attached in 1.7 s; a killed daemon healed
+inside one command in 2.1 s; a dropped socket in 1.6 s; a closed tab in 1.5 s.
 
 ## Identity and session naming
 
@@ -233,7 +307,10 @@ twenty, and past that point new sessions time out even with a healthy Chrome.
 ## Metadata
 
 Each session directory holds a `session.meta` key-value file: version, owner id and key,
-session, label, slot, port, CDP URL, socket dir, owned target id, created time. The
+session, label, slot, port, CDP URL, socket dir, owned target id, created time, and the
+`persistent`, `react` and `auto_approve` flags a heal re-passes. The flags are optional
+keys, so an older dispatcher reads the file unchanged. The root is a cache directory, not
+`$TMPDIR`, which macOS purges out from under a live wrapper. The
 dispatcher rejects any version other than the current one, and any file whose owner key
 does not match its owner id, slot and port.
 
