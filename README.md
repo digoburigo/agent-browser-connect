@@ -11,7 +11,7 @@ It wraps [`agent-browser`](https://github.com/vercel-labs/agent-browser) so that
 ## Prerequisites
 
 - **bash**, **node** (for the small JSON helpers), and standard Unix tools
-- **`agent-browser`** on your `PATH`: `npm install -g agent-browser` (tested against 0.38.x)
+- **`agent-browser`** on your `PATH`: `npm install -g agent-browser` (tested against 0.39.1)
 - **Google Chrome** (or Chromium / Brave / Chrome Canary) with remote debugging on: open `chrome://inspect/#remote-debugging`, tick **Enable**, wait for `Server running at: 127.0.0.1:9222`. Chrome remembers this across restarts.
 
 macOS and Linux. Windows is not supported (WSL should work; untested).

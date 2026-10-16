@@ -339,7 +339,8 @@ heal_session() {
         # 2026-09-25). Stop it first — only this session's, proven by its pid
         # file and process name — so the TERM below runs a rollback that
         # finishes and restores session.meta. Its `.target` sidecar stays, so
-        # the next heal rebinds the same tab.
+        # the next heal rebinds the same tab. Still needed on 0.39 (#2059): a
+        # SIGTERM now waits for the running command, and this attach never ends.
         daemon_pid="$(sed -n '1p' "$socket_dir/$PATH_SESSION.pid" 2>/dev/null || true)"
         if ab_is_uint "$daemon_pid" && ps -o comm= -p "$daemon_pid" 2>/dev/null | grep -q 'agent-browser'; then
           kill -KILL "$daemon_pid" 2>/dev/null || true

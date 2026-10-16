@@ -227,7 +227,7 @@ assert_eq "$(inspect_json | page_count)" "$AFTER_CONNECT_COUNT"
 pass "real-browser command serialization"
 
 agent-browser --session "$SESSION" tab new "$BASE_URL/drift" >/dev/null
-DRIFT_TARGET="$(agent-browser --session "$SESSION" tab list --json | node "$JSON" tab-state | awk 'NR == 1 { print; exit }')"
+DRIFT_TARGET="$(agent-browser --session "$SESSION" tab list --json | node "$JSON" tab-state | sed -n 's/^active_target=//p')"
 [ "$DRIFT_TARGET" != "$OWNED_TARGET" ] || fail "test setup did not drift the binding"
 set +e
 DRIFT_OUTPUT="$("$AB" get url 2>&1)"
@@ -236,7 +236,7 @@ set -e
 assert_eq "$DRIFT_STATUS" "0"
 assert_contains "$DRIFT_OUTPUT" "drifted; restored the owned target before running"
 assert_contains "$DRIFT_OUTPUT" "$BASE_URL/base"
-ACTIVE_AFTER_RESTORE="$(agent-browser --session "$SESSION" tab list --json | node "$JSON" tab-state | awk 'NR == 1 { print; exit }')"
+ACTIVE_AFTER_RESTORE="$(agent-browser --session "$SESSION" tab list --json | node "$JSON" tab-state | sed -n 's/^active_target=//p')"
 assert_eq "$ACTIVE_AFTER_RESTORE" "$OWNED_TARGET"
 assert_eq "$("$AB" get url)" "$BASE_URL/base"
 pass "real-browser binding drift recovery"

@@ -25,7 +25,8 @@ approval mode prompts again. Since 0.38 the replaced socket is closed rather tha
 stranded (upstream #1739), so the cost is the dialog, not an accumulating pile. `connect.sh` checks raw TCP, reads the
 matching `DevToolsActivePort` file without opening a WebSocket, and hands agent-browser
 the exact URL. It attaches once and does not retry blindly; a repeated dialog means
-another process is reconnecting. `--persistent` is the one bounded exception (see below). Last verified against agent-browser 0.38.0 (2026-09-16).
+another process is reconnecting. `--persistent` is the one bounded exception (see below). Last verified against agent-browser 0.39.1 (2026-10-15): the disposable-profile suite
+and the user-Chrome guard probe each attached once (`attach=1`, no other foreground events).
 
 ## Version mismatch after an upgrade
 
@@ -76,7 +77,11 @@ run that same re-run itself, under three bounds:
   a watchdog stops it after `AB_HEAL_TIMEOUT_SECONDS` (90). The order matters: while the
   daemon waits on the dialog, connect's rollback `close` blocks on the daemon too. So the
   watchdog kills that session's daemon first (proven by its pid file and process name), then
-  TERMs connect, whose rollback finishes and restores `session.meta`.
+  TERMs connect, whose rollback finishes and restores `session.meta`. Upstream #2059 (0.39.0)
+  does not retire the kill: the daemon now accepts new connections while a command holds its
+  state lock, but a SIGTERM still waits for that command to finish, and an attach blocked on
+  an unanswered dialog does not finish. (Read from the PR, not re-measured: that means
+  deliberately leaving a dialog unanswered in the user's Chrome.)
 
 The heal hands the session lock to connect and takes it back. It passes the recorded owner
 (`AB_CONNECT_ID`, or `--session` for `explicit:` owners), slot, port, `--react` and
@@ -149,6 +154,19 @@ one, connect refuses rather than inventing a random identity that would leak a t
    same guard as a single command.
 5. Reads `tab list` again. If the binding moved, restores it and exits 9. If Chrome's
    page count grew, prints a one-line note and leaves the new page alone.
+
+### Lost replies: `outcome_unknown`
+
+Through 0.39.0 the CLI re-sent a command up to five times when the daemon's reply was
+lost, even after the request had been written, so a `click` or `fill` could run twice
+(upstream #2032). Since 0.39.1 (#2085) only read-only commands are retried; a mutating one
+fails with `code: "outcome_unknown"` (kept in `--json` and batch output). The dispatcher
+passes that through unchanged, and its post-command `tab list` usually fails next (exit 9),
+because the reply was lost to a dying daemon. That is where an agent is tempted to
+reconnect and repeat the action, so `SKILL.md` tells it to read the page state first.
+
+A persistent heal never replays a command: it runs only from `preflight`, before the
+command is sent.
 
 ### What the guard permits
 

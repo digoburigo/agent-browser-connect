@@ -52,6 +52,7 @@
 0	vitals
 0	a11y	--tags	wcag2a
 0	read	http://example.test/	--outline
+0	read	http://example.test/	--use-system-ca
 
 ## React, permitted through the session hook connect.sh --react installs
 0	react	tree
