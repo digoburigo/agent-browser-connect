@@ -24,9 +24,84 @@ launch-affecting flags differ from the previous one's: the daemon dials a new so
 approval mode prompts again. Since 0.38 the replaced socket is closed rather than
 stranded (upstream #1739), so the cost is the dialog, not an accumulating pile. `connect.sh` checks raw TCP, reads the
 matching `DevToolsActivePort` file without opening a WebSocket, and hands agent-browser
-the exact URL. It attaches once and does not retry blindly; a repeated dialog means
-another process is reconnecting. `--persistent` is the one bounded exception (see below). Last verified against agent-browser 0.39.1 (2026-10-15): the disposable-profile suite
+the exact URL. It attaches once and does not retry blindly. Repeated dialogs mean new
+connections: check task cleanup, setting changes and daemon loss before blaming another
+process. `--persistent` adds bounded recovery (see below). Last verified against agent-browser 0.39.1 (2026-10-15): the disposable-profile suite
 and the user-Chrome guard probe each attached once (`attach=1`, no other foreground events).
+
+## Conversation lifetime, task cleanup, and native idle shutdown
+
+A stable session name is not an approved WebSocket. Previously the skill ordered a full
+release after each task, deleting state and stopping the daemon. The next task used the
+same name but made a fresh connection, so Chrome quite correctly asked again. Local
+history showed four fresh attaches for one owner in a single day. Repeated connect also
+reset `persistent`, `react` and `auto_approve` to zero whenever flags were omitted.
+
+The lifecycle now separates three operations:
+
+- **Task cleanup** (`cleanup.sh --keep-alive`) removes network routes on the proven live
+  connection, retaining the daemon, wrapper, target and policy.
+  It fails without disconnecting if route removal fails or would require reconnecting.
+  The agent stops its own traces/profilers before this step.
+- **Native idle shutdown** stops only this session's daemon after one hour without commands.
+  It preserves the tab sidecar and owner metadata, including explicit auto-approval
+  policy, so a resume can rebind the same tab without renegotiating the user's opt-in.
+  Chrome still needs a new transport approval after idle shutdown unless auto-approval
+  was explicitly enabled.
+- **Full release** (plain cleanup, or `--close-tab`) forgets the connection and settings.
+  It is for explicit disconnect or conversation termination, not each final response.
+  A skill cannot detect every harness's conversation end; native idle shutdown bounds daemon lifetime.
+
+Settings are tri-state at the CLI: omitted = inherit from verified owner metadata,
+positive flag = enable, negative flag = disable. `ab_configure_policy` in `lib.sh`
+owns defaults, inheritance and validation after ownership is proven. Missing booleans
+default to disabled; malformed booleans fail before daemon inspection and matching
+negative flags can repair them. Consent is never
+inferred from an existing tab or another owner. `--no-react` affects future attachments;
+an installed init script cannot be uninstalled from a live daemon by changing metadata.
+
+`--idle-timeout` is inherited. `AB_IDLE_TIMEOUT_SECONDS` defaults a new session to
+3600 seconds. An existing owner missing the timeout uses a fixed 3600 seconds regardless
+of the current environment. Zero disables native idle shutdown. `ab_configure_policy`
+derives and exports `AGENT_BROWSER_IDLE_TIMEOUT_MS` from normalized saved or requested
+seconds for every CLI invocation. Ambient native timeout values cannot override owner
+policy. Milliseconds are never persisted. The maximum accepted seconds value is
+2147483647, which converts to 2147483647000 milliseconds.
+
+Agent-browser owns the timer. Attached browsers are exempt from its default idle timeout,
+not from an explicitly configured timeout. A running command can outlast the configured
+idle interval. Native expiration is independent of the shell lock, so transport can
+disconnect between preflight and forwarding. The dispatcher never replays a sent action.
+The disposable regression delays a mutation beyond expiry, then verifies one mutation,
+the same owned target and no additional tabs.
+
+Changing a live timeout is a connect transaction. Connect validates desired policy first,
+then inspects and stops the old daemon using its saved native configuration. It requires
+verified inactivity before applying the desired timeout and attaching the replacement.
+The old target and sidecar remain. Metadata is staged and atomically committed only after
+target proof. Unchanged settings retain the daemon and socket. A timeout change never
+receives the version-swap-only retry.
+
+On failure, connect stops an uncommitted replacement before restoring old metadata and
+the wrapper. If replacement shutdown cannot be verified, connect disables the wrapper and
+quarantines the old metadata in the session directory. Backups and target sidecars remain
+for manual recovery. It does not authorize commands against a daemon with a different
+policy from restored metadata.
+
+Older watcher-managed records require one explicit connect before a cached wrapper can
+run browser commands. Records with legacy lease or activity keys, or no saved timeout,
+do not prove native configuration. Migration uses a fixed zero setting for non-connecting
+diagnostics and verified daemon stop, then applies the resolved policy. Missing timeout
+uses the fixed legacy default. Explicit positive and negative choices still take
+precedence, including repair of malformed saved consent. Successful publication removes
+the legacy keys. Existing watchers lose metadata authority and exit on their next read,
+within a minute. No unverified watcher PID is killed and no upgrade supervisor exists.
+
+Agent-browser 0.39.1 can acknowledge `close` before its daemon exits. Explicit release,
+timeout replacement and version swaps use `ab_stop_daemon` to poll non-connecting
+`session info` under the owner lock until inactivity is verified. A positive close
+reply alone is not success. Unproven-metadata release uses a fixed zero timeout only for
+non-connecting diagnostics and daemon stop. It performs no browser commands.
 
 ## Version mismatch after an upgrade
 
@@ -49,7 +124,7 @@ where they already inspect the session:
   target and closes that tab — but only when it is the tab this attach bound to and it
   never left `about:blank`.
 - This is also the only path allowed a second attach attempt. Everywhere else the script
-  attaches once on purpose (a repeated dialog means another process is reconnecting), but
+  attaches once on purpose (blind retries could stack approval dialogs), but
   here it stopped a working daemon, and a freshly started daemon's first command
   sometimes times out; failing would leave the user with no session at all.
 
@@ -84,8 +159,12 @@ run that same re-run itself, under three bounds:
   deliberately leaving a dialog unanswered in the user's Chrome.)
 
 The heal hands the session lock to connect and takes it back. It passes the recorded owner
-(`AB_CONNECT_ID`, or `--session` for `explicit:` owners), slot, port, `--react` and
-`--auto-approve`, so the re-run lands on the same session. For a closed tab it also passes
+(`AB_CONNECT_ID`, or `--session` for `explicit:` owners), slot, port and an internal
+`--recover` context. It passes no policy flags. Under its lock, connect requires current
+metadata proving that owner and currently enabled persistence before inspecting the daemon.
+A newer opt-out therefore survives recovery, and full release cannot be undone by a
+pending heal. The dispatcher reloads identity and all policy after healing. An incomplete
+target is healable only after identity and policy validation. For a closed tab it also passes
 `--replace-url`: the URL from agent-browser's `<session>.target` sidecar, which the CLI
 rewrites after every command but sanitizes (the query string is dropped). `json.mjs
 target-url` accepts only http(s) or `about:blank`.
@@ -121,14 +200,17 @@ settings", "Cancel" and "Allow". Titles are overridable (`AB_APPROVE_APP`,
 **The sheet names no client**, so any process that dials 9222 while the approver runs gets
 approved too. The time window is the only scope there is, and it is kept small:
 
-- It runs only around a connection this session opens: connect's attach, and, in the
-  dispatcher, the one call after `lsof` shows the daemon has no established socket (the
-  redial case). It is never a background clicker.
+- It runs only around a connection this session opens: a fresh attach, or the one call
+  after `lsof` proves an existing daemon has no established socket (the redial case).
+  Re-running connect on a proven live socket starts no approver. Unknown socket state
+  does not authorize a click. It is never a background clicker.
 - It presses at most once, then exits; the caller kills it when the command returns.
 - A sheet already open before it starts belongs to someone else, so auto-approve stands
   down (`auto-approve-skipped`) and the user answers by hand.
-- It is opt-in per session, because it trades a security prompt for convenience and that
-  trade is the user's to make.
+- It is opt-in per owner session, because it trades a security prompt for convenience
+  and that trade is the user's to make. The explicit opt-in survives follow-ups, heals
+  and native idle shutdown; `--no-auto-approve` or full release revokes it. Ordinary permission
+  to use the browser does not imply permission to press this security button.
 
 Measured: connect with a dead daemon approved and attached in 1.7 s; a killed daemon healed
 inside one command in 2.1 s; a dropped socket in 1.6 s; a closed tab in 1.5 s.
@@ -268,9 +350,8 @@ three scripts at once, and nothing failed when it happened. Two readers in
   That rule used to be a comment repeated at three call sites; it is now a
   property of the function, and a test asserts the flag never appears.
 - `ab_tab_state` publishes `AB_TAB_*` from `tab list --json`. The command itself
-  stays with the caller because the invocation legitimately differs — attached
-  callers pass `--cdp --pin-tab --session`, teardown must not — so only the shape
-  moved.
+  stays with attached callers, which pass `--cdp --pin-tab --session`. Cleanup uses
+  the separate fixed native bridge, not an ordinary CLI invocation.
 
 `session.meta` gained an interface for the same reason. The ownership invariant
 is the one safety property this repo has, and it was transcribed three times:
@@ -286,18 +367,36 @@ to appear in all three files.
 
 ## Batch: what is guarded is what runs
 
-`batch` in argument mode used to be checked and then forwarded differently. Each
-argument was split by `json.mjs`, the resulting words were guarded, and then the
-**original string** was handed to agent-browser to parse again. Two parsers
-deciding one policy only holds while they agree, and they did not: `json.mjs`
-splits on spaces and treats a tab as an ordinary character, so
-`batch $'tab\tnew http://x'` guarded as the single unknown verb `tab<TAB>new`
-while a whitespace-splitting parser downstream could read it as `tab new`.
+Batch has one external shape, JSON `string[][]` on stdin. Each member is a nonempty
+array of strings. Empty argument strings, spaces, tabs, quotes, backslashes and Unicode
+survive unchanged. An empty outer array remains accepted by the native CLI.
 
-The dispatcher now re-encodes the guarded words with `json.mjs batch-encode` and
-sends them as the JSON array-of-arrays that the stdin path already used. There is
-one parse, and the words the guard approved are the words that run. `--bail` and
-`--json` stay CLI flags and are not folded into the command array.
+```bash
+printf '%s\n' '[["fill","#name",""],["snapshot","-i"]]' | bash <wrapper> batch --bail --json
+```
+
+Migrate quoted command operands to arrays. For example, replace `batch 'get url'`
+with `printf '%s\n' '[["get","url"]]' | bash <wrapper> batch`. Quoted operands now
+fail with a JSON-stdin migration message. Only `--bail` and `--json` are batch flags
+outside the arrays. Ordinary single commands keep their existing interface.
+
+`json.mjs batch-check <bash-path> <guard-path>` reads raw stdin directly. Bash must
+not capture raw input first because command substitution erases literal NUL. The helper
+validates the complete JSON schema before starting guard children. NUL, CR, LF and unit
+separator inside words remain prohibited.
+
+Each member is sent through exact argv to the authoritative Bash guard with nested
+batch disabled. Child calls use `spawnSync`, argument arrays and `shell: false`.
+Guard stdout is discarded and diagnostics remain on stderr. Deliberate refusals retain
+status 2 and unknown commands or flags retain status 10. Child execution errors and
+signals fail closed with status 2 before daemon access. Canonical JSON is emitted only
+after every member passes. Preflight and native execution follow validation.
+
+The shell-word tokenizer, quoted-program accumulation and separator transport are gone.
+There is no compatibility parser or second word grammar. The operating system imposes
+an argv size limit on each guard child. Oversized members fail closed, even if native
+stdin alone could carry them. One Bash guard child per member is an accepted tradeoff;
+no performance improvement is claimed.
 
 ## Containment boundary
 
@@ -309,25 +408,42 @@ reports and preserves both. Command pinning is not a one-window guarantee.
 
 ## Cleanup
 
-Cleanup talks to the existing daemon without `--cdp`. By default it clears network
-routes, stops the daemon, removes session state, and leaves the Chrome tab open as a
-normal user tab. Passing `--close-tab` opts into closing the exact target id recorded at
-connect time, and only when the metadata proves ownership. If that target cannot be
-closed without reconnecting, cleanup detaches, reports that it may remain, and exits 6
-rather than causing another approval dialog. Routes are cleared first because an abort
-route on a live session once left the user's own devtools scripts blocked and looked
-like a broken app.
+Cleanup uses `scripts/admin.mjs` on the validated existing native socket. Omitting
+`--cdp` from an ordinary CLI browser command is not safe teardown. The CLI can bootstrap
+a daemon or apply ambient launch settings. The bridge has fixed operations, sends no
+separate CLI launch and never bootstraps a daemon or replays an uncertain action.
 
-Sessions attached to a user's browser are exempt from agent-browser's idle shutdown, so
-every session left behind is a daemon that lives until reboot. One machine accumulated
-twenty, and past that point new sessions time out even with a healthy Chrome.
+`--keep-alive` clears task routes and retains the live connection. Plain release only
+stops the daemon, which disables interception. Malformed policy denies route and tab
+operations but does not prevent independently verified release. `--close-tab` requires
+valid policy and exact target ownership. Unverified closure returns partial status 6
+after verified shutdown. Unknown shutdown retains recovery artifacts with status 5.
+If native expiry wins after keep-alive preflight, cleanup refuses rather than silently
+releasing; plain release can reconcile explicitly reported inactivity.
+
+The bridge depends on the native protocol tested with agent-browser 0.39.1. It uses a
+30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported frames,
+responses or confirmation requests fail closed. No historical protocol compatibility
+is promised. Diagnostics require an explicit boolean `active`; a missing or malformed
+field cannot prove inactivity.
+
+Existing-only transport does not make browser actions atomic with CDP preflight.
+Native route and tab handlers can redial their backend if health changes afterward.
+Target resolution also retains a native list-to-close race. Native completion and
+listing establish manager state, not independent proof that Chrome removed a target.
+The disposable suite separately inspects actual target absence, daemon PIDs and
+established CDP sockets. It does not exercise real approval dialogs.
+
+Attached browsers are exempt only from agent-browser's default timeout. The explicit
+owner timeout enables native shutdown without destroying policy or target bindings.
 
 ## Metadata
 
 Each session directory holds a `session.meta` key-value file: version, owner id and key,
 session, label, slot, port, CDP URL, socket dir, owned target id, created time, and the
-`persistent`, `react` and `auto_approve` flags a heal re-passes. The flags are optional
-keys, so an older dispatcher reads the file unchanged. The root is a cache directory, not
+`persistent`, `react` and `auto_approve` policy, plus normalized `idle_timeout_seconds`.
+New records contain no idle lease or activity fields. Existing version-4 records remain
+readable for deliberate migration through connect. The root is a cache directory, not
 `$TMPDIR`, which macOS purges out from under a live wrapper. The
 dispatcher rejects any version other than the current one, and any file whose owner key
 does not match its owner id, slot and port.

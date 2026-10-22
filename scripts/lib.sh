@@ -81,6 +81,12 @@ ab_meta_value() {
   awk -v key="$key" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' "$file"
 }
 
+ab_native_migration_required() {
+  local file="$1"
+  grep -Eq '^(lease_token|last_used_at)=' "$file" \
+    || [ -z "$(ab_meta_value "$file" idle_timeout_seconds 2>/dev/null || true)" ]
+}
+
 ab_validate_meta_value() {
   local value="$1"
   case "$value" in
@@ -118,6 +124,53 @@ ab_set_meta_value() {
     return 1
   }
   mv -f "$tmp" "$file"
+}
+
+# The caller proves ownership before supplying saved metadata. Empty requests
+# inherit; recovery supplies none, so saved consent never becomes fresh intent.
+ab_configure_policy() {
+  local file="$1" persistent="${2:-}" react="${3:-}" approve="${4:-}" idle="${5:-}" setting
+  AB_POLICY_PERSISTENT=""
+  AB_POLICY_REACT=""
+  AB_POLICY_AUTO_APPROVE=""
+  AB_POLICY_IDLE_TIMEOUT_SECONDS=""
+  AB_POLICY_ERROR=""
+
+  [ -n "$persistent" ] || persistent="$(ab_meta_value "$file" persistent 2>/dev/null || true)"
+  [ -n "$react" ] || react="$(ab_meta_value "$file" react 2>/dev/null || true)"
+  [ -n "$approve" ] || approve="$(ab_meta_value "$file" auto_approve 2>/dev/null || true)"
+  persistent="${persistent:-0}"
+  react="${react:-0}"
+  approve="${approve:-0}"
+  for setting in "persistent=$persistent" "react=$react" "auto_approve=$approve"; do
+    case "${setting#*=}" in
+      0|1) ;;
+      *)
+        AB_POLICY_ERROR="Invalid saved session setting $setting; pass the matching explicit --no- option to disable it."
+        echo "✗ $AB_POLICY_ERROR" >&2
+        return 5
+        ;;
+    esac
+  done
+  [ -n "$idle" ] || idle="$(ab_meta_value "$file" idle_timeout_seconds 2>/dev/null || true)"
+  # Legacy owners must resolve identically across processes with different env.
+  if [ -z "$idle" ]; then
+    if [ "$file" = /dev/null ]; then
+      idle="${AB_IDLE_TIMEOUT_SECONDS:-3600}"
+    else
+      idle=3600
+    fi
+  fi
+  if ! idle="$(ab_normalize_idle_timeout "$idle")"; then
+    AB_POLICY_ERROR="idle timeout must be an integer from 0 to 2147483647 seconds"
+    echo "✗ $AB_POLICY_ERROR" >&2
+    return 2
+  fi
+  AB_POLICY_PERSISTENT="$persistent"
+  AB_POLICY_REACT="$react"
+  AB_POLICY_AUTO_APPROVE="$approve"
+  AB_POLICY_IDLE_TIMEOUT_SECONDS="$idle"
+  export AGENT_BROWSER_IDLE_TIMEOUT_MS="$((idle * 1000))"
 }
 
 # Append one line to the session's events.log. Records every operation that can
@@ -256,6 +309,15 @@ ab_normalize_port() {
   [ "${#value}" -le 5 ] || return 1
   local normalized=$((10#$value))
   [ "$normalized" -ge 1 ] && [ "$normalized" -le 65535 ] || return 1
+  printf '%s' "$normalized"
+}
+
+# The accepted seconds and their millisecond conversion fit 64-bit arithmetic.
+ab_normalize_idle_timeout() {
+  local value="${1:-}" normalized
+  ab_is_uint "$value" && [ "${#value}" -le 10 ] || return 1
+  normalized=$((10#$value))
+  [ "$normalized" -le 2147483647 ] || return 1
   printf '%s' "$normalized"
 }
 
@@ -518,9 +580,37 @@ ab_session_info() {
   return 0
 }
 
-# Publish `tab list --json` output as AB_TAB_*. The command itself stays with the
-# caller on purpose: an attached caller must pass --cdp --pin-tab --session and
-# teardown must not, and that difference is load-bearing. Only the shape is here.
+ab_admin_existing() {
+  [ "$#" -ge 6 ] || return 5
+  local node="$1" helper="$2" session="$3" socket_dir="$4" pid="$5" operation="$6"
+  shift 6
+  case "$operation:$#" in
+    clear-task-routes:0|close-owned-target:1|discard-new-attach-target:2|close-daemon:0) ;;
+    *) return 5 ;;
+  esac
+  "$node" "$helper" "$operation" "$session" "$socket_dir" "$pid" "$@"
+}
+
+# close acknowledges shutdown before the daemon necessarily exits (0.39.1).
+# Verify inactivity without --cdp while still holding the owner lock, so a quick
+# resume cannot race the exiting daemon. Never kill a PID merely to meet a timer.
+ab_stop_daemon() {
+  local bin="$1" node="$2" helper="$3" session="$4"
+  local attempts="${AB_STOP_ATTEMPTS:-50}" delay="${AB_STOP_DELAY_SECONDS:-0.1}" attempt
+  ab_is_uint "$attempts" && [ "${#attempts}" -le 4 ] || return 1
+  attempts=$((10#$attempts))
+  ab_session_info "$bin" "$node" "$helper" "$session" || return 1
+  [ "$AB_SESSION_ACTIVE" != "1" ] && return 0
+  ab_admin_existing "$node" "${helper%/*}/admin.mjs" "$session" "$AB_SESSION_SOCKET_DIR" "$AB_SESSION_PID" close-daemon >/dev/null 2>&1 || true
+  for ((attempt = 0; attempt <= attempts; attempt += 1)); do
+    ab_session_info "$bin" "$node" "$helper" "$session" || return 1
+    [ "$AB_SESSION_ACTIVE" != "1" ] && return 0
+    [ "$attempt" -lt "$attempts" ] || return 1
+    sleep "$delay" || return 1
+  done
+}
+
+# Publish attached `tab list --json` output as AB_TAB_*.
 ab_tab_state() {
   local node="$1"
   local helper="$2"
@@ -548,8 +638,8 @@ ab_tab_state() {
 # checked only the owner key. One implementation, and callers choose what a
 # failure means to them.
 #
-# require_target=1 additionally demands a recorded owned target; connect.sh
-# writes the file before it knows one, so that is not always an error.
+# require_target=1 additionally demands a recorded owned target. connect.sh
+# permits legacy interrupted records without one while resolving saved policy.
 # On failure returns 1 with AB_META_ERROR set to a caller-printable reason.
 ab_load_meta() {
   local file="$1"

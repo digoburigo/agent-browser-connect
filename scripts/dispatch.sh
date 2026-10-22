@@ -56,33 +56,32 @@ preflight_fail() {
 }
 
 load_meta() {
-  if ! ab_load_meta "$META" "$PATH_SESSION" 1; then
-    case "$AB_META_ERROR" in
-      # connect.sh writes the file before it knows its target, so a record
-      # without one is an interrupted connect — the one metadata failure a
-      # re-run fixes. Every other one is a tampered or foreign file.
-      *"owned target"*)
-        preflight_fail 8 "✗ Browser wrapper metadata is outdated or unusable ($AB_META_ERROR); re-run connect.sh." no-owned-target
-        ;;
-      *)
-        preflight_fail 5 "✗ Browser wrapper metadata is outdated or unusable ($AB_META_ERROR); re-run connect.sh."
-        ;;
-    esac
+  if ! ab_load_meta "$META" "$PATH_SESSION" 0; then
+    preflight_fail 5 "✗ Browser wrapper metadata is outdated or unusable ($AB_META_ERROR); re-run connect.sh."
+    return 1
+  fi
+  if ! ab_configure_policy "$META"; then
+    preflight_fail 5 "✗ Browser wrapper policy is unusable ($AB_POLICY_ERROR); re-run connect.sh."
     return 1
   fi
   SESSION="$AB_META_SESSION"
   PORT="$AB_META_PORT"
   CDP_URL="$AB_META_CDP_URL"
   OWNED_TARGET_ID="$AB_META_OWNED_TARGET_ID"
+  if ab_native_migration_required "$META"; then
+    preflight_fail 8 "✗ This owner needs an explicit connect to migrate its idle configuration; no browser command was sent."
+    return 1
+  fi
+  # An interrupted record is healable only after identity and policy are proven.
+  if [[ ! "$OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    preflight_fail 8 "✗ Browser wrapper metadata records no valid owned target; re-run connect.sh." no-owned-target
+    return 1
+  fi
 }
-
-# Read straight from the file, not through load_meta: the flag must be known
-# even when the record fails validation for a healable reason.
-PERSISTENT="$(ab_meta_value "$META" persistent 2>/dev/null || true)"
 
 META_OK=1
 if ! load_meta; then
-  if [ -z "$HEAL_REASON" ] || [ "$PERSISTENT" != "1" ]; then
+  if [ -z "$HEAL_REASON" ] || [ "$AB_POLICY_PERSISTENT" != "1" ]; then
     echo "$FAIL_MSG" >&2
     exit "$FAIL_CODE"
   fi
@@ -99,73 +98,24 @@ if [ "${NODE_BIN#/}" = "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
 fi
 
 # Every command is checked against the allow-list in guard.sh before the daemon
-# is touched at all. Applied to the top-level command and to every line inside a
+# is touched at all. Applied to the top-level command and to every member inside a
 # batch; exit 2 means deliberately forbidden, exit 10 means not in the allow-list.
 ab_guard_command 1 "$@" || exit $?
 COMMAND_NAME="${1:-}"
 
-# A batch is forwarded only after every line inside it passes the same guard.
-# Argument mode: each quoted argument is one command string. Stdin mode: a JSON
-# array of string arrays, read fully here so nothing is sent before scanning.
 BATCH_STDIN=""
 if [ "${1:-}" = "batch" ]; then
-  BATCH_HAS_COMMANDS=0
-  BATCH_GUARDED=""
-  BATCH_FLAGS=()
   for argument in "${@:2}"; do
     case "$argument" in
-      --bail|--json)
-        BATCH_FLAGS+=("$argument")
-        continue
+      --bail|--json) ;;
+      *)
+        echo "✗ Batch operands are no longer accepted. Send JSON string arrays on stdin; only --bail and --json are batch flags." >&2
+        exit 2
         ;;
     esac
-    BATCH_HAS_COMMANDS=1
-    if ! BATCH_LINE="$(printf '%s' "$argument" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" batch-argument 2>&1)"; then
-      echo "✗ batch argument was rejected: $BATCH_LINE" >&2
-      exit 2
-    fi
-    if [ -z "$BATCH_LINE" ]; then
-      # Expanding an empty array under `set -u` is a hard error on bash 3.2, the
-      # bash `#!/usr/bin/env bash` resolves to on stock macOS, so this is caught
-      # here rather than crashing the dispatcher with `unbound variable`.
-      echo "✗ An empty batch argument is blocked: it is not a command." >&2
-      exit 2
-    fi
-    IFS=$'\x1f' read -ra BATCH_WORDS <<< "$BATCH_LINE"
-    ab_guard_command 0 "${BATCH_WORDS[@]}" || exit $?
-    BATCH_GUARDED="$BATCH_GUARDED$BATCH_LINE
-"
   done
-  if [ "$BATCH_HAS_COMMANDS" -eq 1 ]; then
-    # Forward the words that were guarded, not the strings they were parsed from.
-    # Handing agent-browser the original argument would make two parsers decide
-    # one policy, and they disagree: json.mjs splits on spaces and treats a tab as
-    # an ordinary character, so `batch $'tab\tnew http://x'` guards as the single
-    # unknown verb "tab<TAB>new" while a whitespace-splitting parser downstream
-    # could read it as `tab new`. Re-encoding to the JSON stdin form, which is
-    # already the shape the stdin path uses, removes the second parse entirely.
-    if ! BATCH_STDIN="$(printf '%s' "$BATCH_GUARDED" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" batch-encode 2>&1)"; then
-      echo "✗ batch commands could not be re-encoded safely: $BATCH_STDIN" >&2
-      exit 2
-    fi
-    set -- batch ${BATCH_FLAGS[@]+"${BATCH_FLAGS[@]}"}
-  fi
-  if [ "$BATCH_HAS_COMMANDS" -eq 0 ]; then
-    if [ -t 0 ]; then
-      echo "✗ 'batch' needs quoted command arguments or a JSON array on stdin." >&2
-      exit 2
-    fi
-    BATCH_STDIN="$(cat)"
-    if ! BATCH_LINES="$(printf '%s' "$BATCH_STDIN" | "$NODE_BIN" "$SCRIPT_DIR/json.mjs" batch-stdin 2>&1)"; then
-      echo "✗ batch stdin was rejected: $BATCH_LINES" >&2
-      exit 2
-    fi
-    while IFS= read -r BATCH_LINE; do
-      [ -n "$BATCH_LINE" ] || continue
-      IFS=$'\x1f' read -ra BATCH_WORDS <<< "$BATCH_LINE"
-      ab_guard_command 0 "${BATCH_WORDS[@]}" || exit $?
-    done <<< "$BATCH_LINES"
-  fi
+  # Node must read raw stdin before Bash command substitution can erase NUL.
+  BATCH_STDIN="$("$NODE_BIN" "$SCRIPT_DIR/json.mjs" batch-check "$BASH" "$SCRIPT_DIR/guard.sh")" || exit $?
 fi
 
 browser_command() {
@@ -187,6 +137,10 @@ restore_owned_target() {
 # preflight_fail instead of exiting, so a persistent session can heal and ask
 # again; outside persistent mode the caller exits exactly as before.
 preflight() {
+  if ab_native_migration_required "$META"; then
+    preflight_fail 8 "✗ This owner needs an explicit connect to migrate its idle configuration; no browser command was sent."
+    return 1
+  fi
   # `|| status=$?` rather than a bare call: a non-zero return from a standalone
   # statement would trip `set -e` before the status could be inspected.
   local status=0
@@ -220,7 +174,7 @@ preflight() {
   # (measured 2026-09-25: after the socket dropped it reconnected by itself, one
   # approval dialog). With --auto-approve that redial is a connection this
   # session opens, so the approver covers exactly that call and no other.
-  if [ "$(ab_meta_value "$META" auto_approve 2>/dev/null || true)" = "1" ] && ab_is_uint "$AB_SESSION_PID"; then
+  if [ "$AB_POLICY_AUTO_APPROVE" = "1" ] && ab_is_uint "$AB_SESSION_PID"; then
     local connected=0
     ab_pid_has_cdp_connection "$AB_SESSION_PID" "$PORT" || connected=$?
     if [ "$connected" -eq 1 ]; then
@@ -293,9 +247,7 @@ heal_session() {
   fi
 
   label="${AB_META_LABEL:-browser}"
-  args=("$label" --persistent --slot "$AB_META_SLOT" --port "$AB_META_PORT")
-  [ "$(ab_meta_value "$META" react 2>/dev/null || true)" != "1" ] || args+=(--react)
-  [ "$(ab_meta_value "$META" auto_approve 2>/dev/null || true)" != "1" ] || args+=(--auto-approve)
+  args=("$label" --recover --slot "$AB_META_SLOT" --port "$AB_META_PORT")
   [ -z "$replace_url" ] || args+=(--replace-url "$replace_url")
 
   ab_log_event "$DIR" heal-start "reason=$reason command=${COMMAND_NAME}"
@@ -372,7 +324,7 @@ heal_session() {
     exit 5
   fi
 
-  if printf 'at=%s\nstatus=%s\nreason=%s\n' "$now" "$status" "$reason" > "$HEAL_STATE.tmp.$$"; then
+  if [ -d "$DIR" ] && printf 'at=%s\nstatus=%s\nreason=%s\n' "$now" "$status" "$reason" > "$HEAL_STATE.tmp.$$"; then
     chmod 600 "$HEAL_STATE.tmp.$$" 2>/dev/null || true
     mv -f "$HEAL_STATE.tmp.$$" "$HEAL_STATE" 2>/dev/null || rm -f "$HEAL_STATE.tmp.$$"
   fi
@@ -395,7 +347,7 @@ while :; do
   if [ "$META_OK" -eq 1 ] && preflight; then
     break
   fi
-  if [ "$PERSISTENT" = "1" ] && [ "$HEALED" -eq 0 ] && [ -n "$HEAL_REASON" ]; then
+  if [ "$AB_POLICY_PERSISTENT" = "1" ] && [ "$HEALED" -eq 0 ] && [ -n "$HEAL_REASON" ]; then
     HEALED=1
     if heal_session "$HEAL_REASON"; then
       if load_meta; then

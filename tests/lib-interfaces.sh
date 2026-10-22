@@ -145,6 +145,21 @@ STUB_MODE=other-session ab_session_info "$STUB" "$NODE_BIN" "$HELPER" "ab-testse
   && bad "session_info: a mismatched session should not return 0" \
   || eq "session_info wrong session" "$?" "2"
 
+for active_json in '{}' '{"active":"false"}' '{"active":null}'; do
+  packet="$(printf '%s' "$active_json" | "$NODE_BIN" -e 'let s=""; for await (const c of process.stdin) s+=c; console.log(JSON.stringify({success:true,data:{session:"probe",...JSON.parse(s)}}))' --input-type=module)"
+  if printf '%s' "$packet" | "$NODE_BIN" "$HELPER" session-info probe >/dev/null 2>&1; then
+    bad "session-info accepted nonboolean active: $active_json"
+  else
+    ok
+  fi
+done
+for active in true false; do
+  decoded="$(printf '{"success":true,"data":{"session":"probe","active":%s}}' "$active" | "$NODE_BIN" "$HELPER" session-info probe)"
+  expected_active=0
+  [ "$active" != true ] || expected_active=1
+  eq "session-info boolean $active" "$(ab__field "$decoded" active)" "$expected_active"
+done
+
 # ---------------------------------------------------------------------------
 # ab_load_meta — one implementation of the ownership invariant
 # ---------------------------------------------------------------------------

@@ -471,3 +471,8 @@ ab_guard_command() {
 
   return 0
 }
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  ab_guard_command 0 "$@"
+  exit $?
+fi

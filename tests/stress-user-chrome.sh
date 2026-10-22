@@ -185,7 +185,7 @@ act() {
       echo "r$round snapshot" >> "$(tab_dir "$n")/log"
       ;;
     5) # batch: several safe commands in one round trip
-      bash "$ab" batch 'get url' 'get title' 'get text #h' \
+      printf '%s\n' '[["get","url"],["get","title"],["get","text","#h"]]' | bash "$ab" batch \
         >"$(tab_dir "$n")/batch.out" 2>>"$(tab_dir "$n")/cmd.err" || fail "tab $n r$round: batch failed"
       grep -q "tab $n page" "$(tab_dir "$n")/batch.out" || fail "tab $n r$round: batch output wrong: $(cat "$(tab_dir "$n")/batch.out")"
       echo "r$round batch" >> "$(tab_dir "$n")/log"

@@ -10,7 +10,26 @@ Chrome's remote-debugging toggle and connection approval are separate:
 - Approval mode still asks once for each incoming WebSocket connection.
 - Another connected agent does not authorize a new connection.
 
-A new helper session should show at most one approval dialog. Approve that one while `connect.sh` waits. The helper performs one attach and does not silently retry; repeated dialogs mean another process is reconnecting.
+First distinguish an agent asking in chat, a harness tool-permission prompt, and Chrome's
+**Allow remote debugging?** dialog. They are different permission layers; a CLI tool
+allow-list cannot suppress Chrome's security dialog. Once browser access is authorized
+for this conversation, the agent should continue through the same wrapper without
+asking for that access again. Automatic clicking of Chrome's dialog is a separate,
+explicit opt-in.
+
+A fresh connection should show at most one Chrome approval. Reusing the live connection
+should show none. When dialogs repeat:
+
+1. Check whether the agent ran plain `cleanup.sh` after the previous task. It stops the
+   approved daemon. Use `cleanup.sh --keep-alive` between tasks; reserve full release
+   for explicit disconnect or conversation termination.
+2. Check the session's `events.log` for `attach mode=fresh`, `timeout-change`, `heal-start`
+   or `version-mismatch`. The same session name does not imply the same connection.
+3. Re-run connect for the same owner/slot, without inventing a new identity or dropping
+   back to bare agent-browser. Omitted flags now preserve settings; only explicit
+   `--no-auto-approve` revokes an existing opt-in (full release also forgets it).
+4. If a live session still reconnects, check flag changes, socket loss and other clients.
+   Repeated dialogs do not by themselves prove another process is at fault.
 
 ### Repeated dialogs during React profiling
 
@@ -52,6 +71,10 @@ Keep using the existing Chrome rather than launching a substitute.
 |---|---|---|
 | `tab_gone` | The owned pinned target was closed | Re-run `connect.sh <any-label> --url <url>` for the same owner/slot. The helper creates one controlled replacement. |
 | First connection times out | Approval was not completed or attachment failed | Approve the one Chrome dialog and re-run connect for the same owner/slot or explicit session. |
+| Browser task finished, but the conversation will continue | Retain the already-approved connection | Stop your trace/profiler, then run `cleanup.sh --keep-alive <session>`. Continue with the same wrapper on follow-ups. |
+| Daemon becomes inactive after idle time | The native timer stopped the daemon, preserving Chrome, the owned tab, wrapper, binding and owner policy | Re-run connect for the same owner and slot, or let a persistent wrapper heal. Chrome needs one new transport approval; a granted `--auto-approve` opt-in is remembered. Change the inherited timeout with `--idle-timeout <seconds>`; `0` disables native shutdown. |
+| `Task routes could not be cleared without reconnecting` | Route cleanup failed, the socket is down, or the daemon version changed | The session was retained rather than disconnected. Recover with the same connect, then retry task cleanup, or explicitly release if finished. |
+| `Invalid saved session setting ...` | A saved boolean is malformed | Connect and keep-alive deny browser operations. Explicit release can still stop the proven existing daemon; optional closure preserves the target and reports status 6. Explicitly disable the named setting (`--no-auto-approve`, `--no-persistent`, `--no-react`) or inspect the private metadata; do not infer consent from a malformed value. |
 | Wrapper reports corrected drift | The persisted binding changed while the owned target still existed | The dispatcher restores the target before running the requested command. Continue through the same wrapper and stop using any bare browser command. |
 | Commands reach the wrong page | A bare agent-browser command bypassed the guard | Return to the wrapper. `tab list` is the only public tab-management operation it permits. |
 | Chrome keeps switching between two agents' tabs | Something brought a tab to the front: a fresh connect (new tabs open in the foreground), a `tab_gone` recovery, a drift restore (`tab <id>` always sends `Page.bringToFront`), or a bare `bringtofront` | Read `events.log` in each agent's wrapper directory (the path `connect.sh` printed, minus `/ab`). Zero `drift-restored` lines means the wrapper is not the cause; look for bare `agent-browser` calls or repeated reconnects. `cleanup.sh` prints the same counts and archives the log under `<wrapper root>/.history/`. |
@@ -97,7 +120,8 @@ bash tests/run.sh
 
 It runs three layers: the allow-list policy (`tests/guard.sh`, no daemon), the structured
 `lib.sh` readers (`tests/lib-interfaces.sh`, no daemon), and the mock-daemon integration
-cases. Against a real browser, `AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh`
+cases, including `tests/lifecycle-cases.sh` for conversation reuse, explicit opt-outs,
+route-only cleanup, native timeout propagation, concurrent handoffs and transactional replacement. Against a real browser, `AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh`
 probes one session in the user's own Chrome and preserves the tab.
 
 Run these from the skill directory. The gated integration suite launches the installed Google Chrome binary with a disposable profile. It never uses the user's profile:
@@ -115,16 +139,42 @@ on macOS and `${XDG_STATE_HOME:-~/.local/state}/agent-browser-connect` elsewhere
 a purged root deleted the wrapper an agent was still calling. Sessions connected before that
 date still use their `$TMPDIR` wrapper until they are cleaned up and connected again.
 
+## Cleanup transport limits
+
+Cleanup sends fixed requests to the validated existing native socket, not bare CLI
+browser commands. Omitting `--cdp` alone does not prevent CLI bootstrap or ambient
+launch changes. The bridge never launches a daemon or replays an uncertain action.
+Native route and tab operations can still redial after CDP preflight if backend health
+changes. Protocol support is tested with 0.39.1, not all historical versions. Active
+I/O has a 30-second deadline and a 256 KiB aggregate response cap; unsupported replies
+fail closed. Keep recovery artifacts after status 5. Status 6 means shutdown completed
+but optional target closure was not verified. Disposable checks inspect actual PIDs,
+sockets and targets, not real approval dialogs.
+
 ## Stale daemons
 
-Browser-attached sessions do not receive the default one-hour idle shutdown. Past roughly 20 attached daemons, new sessions have been observed timing out even though Chrome remained healthy.
+Attached browsers are exempt from agent-browser's default one-hour idle timeout, not an
+explicit native timeout. The skill derives `AGENT_BROWSER_IDLE_TIMEOUT_MS` from saved
+owner policy on each invocation. Native shutdown preserves Chrome, owner policy and the
+target sidecar. `--idle-timeout 0` explicitly disables it despite ambient native settings.
+Old watcher-managed owners need one explicit connect to migrate. Successful publication
+removes the old watcher's authority; it exits on its next read. Cached old wrappers refuse
+browser commands until migration. There is no idle log or replacement watcher.
+
+Past roughly 20 attached daemons, new sessions have been observed timing out even though
+Chrome remained healthy. Inspect the daemon's process and the owner's saved timeout.
+Do not reap another active conversation. A failed timeout replacement stops its new daemon
+before restoring policy. If shutdown is unverified, the wrapper is disabled and recovery
+artifacts remain in its session directory. Report that failure rather than treating the
+old policy as safely restored.
 
 ```bash
 agent-browser session list
-agent-browser --session <stale-name> close
+bash <skill-dir>/scripts/cleanup.sh <owned-stale-session>
 ```
 
-Close stale sessions individually. `agent-browser close --all` can terminate sessions belonging to other agents or active conversations.
+Release only your own stale sessions individually. Do not use bare CLI close as a
+cleanup workaround. `agent-browser close --all` can terminate other conversations.
 
 ## Ephemeral-port exhaustion
 

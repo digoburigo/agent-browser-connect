@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release this agent's exact owned target and task-owned session state.
+# Clear task routes while keeping the connection, or explicitly release it.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,14 +7,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 usage() {
-  echo "usage: cleanup.sh [--close-tab] <session>" >&2
+  echo "usage: cleanup.sh [--keep-alive | --close-tab] <session>" >&2
 }
 
 SESSION=""
 CLOSE_TAB=0
+KEEP_ALIVE=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --close-tab) CLOSE_TAB=1 ;;
+    --keep-alive) KEEP_ALIVE=1 ;;
     -*) usage; exit 2 ;;
     *)
       if [ -n "$SESSION" ]; then
@@ -28,6 +30,10 @@ while [ "$#" -gt 0 ]; do
 done
 if [ -z "$SESSION" ]; then
   usage
+  exit 2
+fi
+if [ "$KEEP_ALIVE" -eq 1 ] && [ "$CLOSE_TAB" -eq 1 ]; then
+  echo "✗ --keep-alive and --close-tab are mutually exclusive." >&2
   exit 2
 fi
 if ! ab_validate_session "$SESSION"; then
@@ -79,19 +85,31 @@ trap 'release_owner_lock; exit 130' INT TERM
 PROVEN_TARGET_ID=""
 OWNED_TARGET_ID=""
 PORT=""
-META_SOCKET_DIR=""
+META_PROVEN=0
+POLICY_PROVEN=0
+export AGENT_BROWSER_IDLE_TIMEOUT_MS=0
 if ab_load_meta "$META" "$SESSION" 1; then
+  META_PROVEN=1
+  if ab_configure_policy "$META"; then
+    POLICY_PROVEN=1
+  fi
+  if ab_native_migration_required "$META" || [ "$POLICY_PROVEN" -eq 0 ]; then
+    export AGENT_BROWSER_IDLE_TIMEOUT_MS=0
+  fi
   PROVEN_TARGET_ID="$AB_META_OWNED_TARGET_ID"
   OWNED_TARGET_ID="$AB_META_OWNED_TARGET_ID"
   PORT="$AB_META_PORT"
-  META_SOCKET_DIR="$AB_META_SOCKET_DIR"
 else
+  export AGENT_BROWSER_IDLE_TIMEOUT_MS=0
   # Unproven is not the same as absent: a target id may still be recorded in a
   # file whose ownership cannot be verified, and the operator should hear that
   # every Chrome target is being preserved rather than that nothing was found.
   OWNED_TARGET_ID="$(ab_meta_value "$META" owned_target_id 2>/dev/null || true)"
-  META_SOCKET_DIR="$(ab_meta_value "$META" socket_dir 2>/dev/null || true)"
   PORT="$(ab_normalize_port "$(ab_meta_value "$META" port 2>/dev/null || printf '%s' "${AB_CDP_PORT:-9222}")" 2>/dev/null || true)"
+fi
+if [ "$KEEP_ALIVE" -eq 1 ] && { [ "$META_PROVEN" -eq 0 ] || [ "$POLICY_PROVEN" -eq 0 ] || ab_native_migration_required "$META"; }; then
+  echo "✗ Cannot clear task routes with unproven session metadata; wrapper retained for recovery." >&2
+  exit 5
 fi
 if [ "$CLOSE_TAB" -eq 1 ] && [ -n "$OWNED_TARGET_ID" ] && [ -z "$PROVEN_TARGET_ID" ]; then
   echo "! Session metadata does not prove exact target ownership; every Chrome target will be preserved." >&2
@@ -131,53 +149,64 @@ ACTIVE="$AB_SESSION_ACTIVE"
 PID="$AB_SESSION_PID"
 PAGE_COUNT="$AB_SESSION_PAGE_COUNT"
 SOCKET_DIR="$AB_SESSION_SOCKET_DIR"
-[ -n "$SOCKET_DIR" ] || SOCKET_DIR="$META_SOCKET_DIR"
-[ -n "$SOCKET_DIR" ] || SOCKET_DIR="$(ab_default_socket_dir)"
+if [ -z "$SOCKET_DIR" ]; then
+  echo "✗ Diagnostics supplied no socket address; wrapper and bindings were retained." >&2
+  exit 5
+fi
 
 HAD_TARGET_BINDING=0
 [ ! -e "$SOCKET_DIR/$SESSION.target" ] || HAD_TARGET_BINDING=1
 TAB_CLOSED=0
 TAB_MAY_REMAIN=0
+if [ "$CLOSE_TAB" -eq 1 ] && { [ "$META_PROVEN" -eq 0 ] || [ "$POLICY_PROVEN" -eq 0 ]; }; then
+  TAB_MAY_REMAIN=1
+fi
 ROUTE_COMMAND_FAILED=0
+CONNECTION_STATE=1
+BROWSER_COMMANDS_SAFE=1
+if [ "$META_PROVEN" -eq 0 ] || [ "$POLICY_PROVEN" -eq 0 ] || ab_native_migration_required "$META"; then
+  export AGENT_BROWSER_IDLE_TIMEOUT_MS=0
+  BROWSER_COMMANDS_SAFE=0
+fi
+if [ "$BROWSER_COMMANDS_SAFE" -eq 1 ] && { [ "$KEEP_ALIVE" -eq 1 ] || [ "$CLOSE_TAB" -eq 1 ]; }; then
+  CLI_VERSION="$(ab_cli_version "$AGENT_BROWSER_BIN" 2>/dev/null || true)"
+  if [ -z "$AB_SESSION_VERSION" ] || [ -z "$CLI_VERSION" ] || [ "$AB_SESSION_VERSION" != "$CLI_VERSION" ]; then
+    BROWSER_COMMANDS_SAFE=0
+  fi
+fi
 
-if [ "$ACTIVE" = "1" ] && [ -n "$PID" ] && [ -n "$PORT" ]; then
-  CONNECTION_STATE=1
-  if ab_pid_has_cdp_connection "$PID" "$PORT"; then
-    CONNECTION_STATE=0
-  else
-    CONNECTION_STATE=$?
+if [ "$ACTIVE" = "1" ] && [ -n "$PID" ] && [ -n "$PORT" ] \
+  && { [ "$KEEP_ALIVE" -eq 1 ] || [ "$CLOSE_TAB" -eq 1 ]; }; then
+  if [ "$BROWSER_COMMANDS_SAFE" -eq 1 ]; then
+    if ab_pid_has_cdp_connection "$PID" "$PORT"; then
+      CONNECTION_STATE=0
+    else
+      CONNECTION_STATE=$?
+    fi
   fi
 
   if [ "$CONNECTION_STATE" -eq 0 ]; then
-    # Omit --cdp during teardown. Cleanup must use the already-running daemon
-    # rather than creating a new Chrome approval merely to close an old target.
-    if ! "$AGENT_BROWSER_BIN" --session "$SESSION" network unroute >/dev/null 2>&1; then
+    if ! ab_admin_existing "$NODE_BIN" "$SCRIPT_DIR/admin.mjs" "$SESSION" "$SOCKET_DIR" "$PID" clear-task-routes >/dev/null; then
       ROUTE_COMMAND_FAILED=1
     fi
-
     if [ "$CLOSE_TAB" -eq 1 ]; then
-      if [ -n "$PROVEN_TARGET_ID" ]; then
-        OWNED_PRESENT=""
-        if TAB_LIST="$("$AGENT_BROWSER_BIN" --session "$SESSION" tab list --json 2>/dev/null)" \
-          && ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$PROVEN_TARGET_ID" "$TAB_LIST"; then
-          OWNED_PRESENT="$AB_TAB_OWNED_PRESENT"
-        fi
-        if [ "$OWNED_PRESENT" = "0" ]; then
-          : # The exact owned target is already gone; foreign targets stay untouched.
-        elif "$AGENT_BROWSER_BIN" --session "$SESSION" tab close "$PROVEN_TARGET_ID" >/dev/null 2>&1; then
-          TAB_CLOSED=1
-        else
-          TAB_MAY_REMAIN=1
-        fi
+      TARGET_RESULT=""
+      if [ -n "$PROVEN_TARGET_ID" ] \
+        && TARGET_RESULT="$(ab_admin_existing "$NODE_BIN" "$SCRIPT_DIR/admin.mjs" "$SESSION" "$SOCKET_DIR" "$PID" close-owned-target "$PROVEN_TARGET_ID")"; then
+        case "$(ab__field "$TARGET_RESULT" target)" in
+          closed) TAB_CLOSED=1 ;;
+          absent) ;;
+          *) TAB_MAY_REMAIN=1 ;;
+        esac
       else
-        # Missing, legacy, or inconsistent metadata is insufficient ownership proof.
-        # Detach the daemon, but preserve every Chrome target for manual recovery.
         TAB_MAY_REMAIN=1
       fi
     fi
-  elif [ "$CLOSE_TAB" -eq 1 ] && [ "$PAGE_COUNT" -gt 0 ]; then
+  elif [ "$CLOSE_TAB" -eq 1 ]; then
     TAB_MAY_REMAIN=1
-    if [ "$CONNECTION_STATE" -eq 2 ]; then
+    if [ "$BROWSER_COMMANDS_SAFE" -eq 0 ]; then
+      echo "! Browser operations are not authorized; cleanup will detach without browser commands." >&2
+    elif [ "$CONNECTION_STATE" -eq 2 ]; then
       echo "! lsof is unavailable, so cleanup will not risk reconnecting to Chrome." >&2
     else
       echo "! The daemon no longer has a CDP connection; cleanup will not open a new approval." >&2
@@ -190,9 +219,23 @@ elif [ "$CLOSE_TAB" -eq 1 ] && { [ "$PAGE_COUNT" -gt 0 ] || [ "$HAD_TARGET_BINDI
   fi
 fi
 
+if [ "$KEEP_ALIVE" -eq 1 ]; then
+  if [ "$ROUTE_COMMAND_FAILED" -eq 1 ] || { [ "$ACTIVE" = "1" ] && [ "$CONNECTION_STATE" -ne 0 ]; }; then
+    echo "✗ Task routes could not be cleared without reconnecting; the connection and wrapper were retained. Re-run connect.sh to recover, or release explicitly." >&2
+    exit 5
+  fi
+  ab_log_event "$DIR" task-reset "connection=retained"
+  if [ "$ACTIVE" = "1" ]; then
+    echo "✓ Session $SESSION kept alive (task routes cleared, approved connection and pinned tab retained)"
+  else
+    echo "✓ Session $SESSION retained (daemon inactive, no live routes; re-run connect.sh to recover)"
+  fi
+  exit 0
+fi
+
 CLOSE_OK=1
 if [ "$ACTIVE" = "1" ]; then
-  if ! "$AGENT_BROWSER_BIN" --session "$SESSION" close >/dev/null 2>&1; then
+  if ! ab_stop_daemon "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION"; then
     CLOSE_OK=0
   fi
 fi
@@ -229,7 +272,7 @@ fi
 
 if [ "$TAB_MAY_REMAIN" -eq 1 ]; then
   echo "! Session $SESSION was detached and routes are inactive, but its owned target could not be closed without reconnecting." >&2
-  echo "  Close that target manually if it is still visible; no new Chrome approval was requested." >&2
+  echo "  Close that target manually if it is still visible; cleanup made no new CLI attachment." >&2
   [ "$ARTIFACTS_OK" -eq 1 ] || echo "  Persistent binding files also require manual removal from: $SOCKET_DIR" >&2
   exit 6
 fi

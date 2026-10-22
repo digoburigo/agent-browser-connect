@@ -25,8 +25,8 @@
 0	press	Enter
 0	press	Control+a
 0	eval	window.location.href
-0	batch	get url
-0	batch	--bail	get url
+0	batch
+0	batch	--bail	--json
 0	tab	list
 0	tab	list	--json
 
@@ -163,4 +163,4 @@
 10	get	somethingnew
 
 ## nested batch would carry a whole unguarded program
-B2	batch	get url
+B2	batch

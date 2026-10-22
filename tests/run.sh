@@ -7,14 +7,26 @@ CLEANUP="$SKILL_DIR/scripts/cleanup.sh"
 # shellcheck source=../scripts/lib.sh
 . "$SKILL_DIR/scripts/lib.sh"
 SUITE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/agent-browser-connect-tests.XXXXXX")"
+SOCKET_TMP="$(mktemp -d /tmp/ab-fixture.XXXXXX)"
+CASE_NUMBER=0
 ORIGINAL_PATH="$PATH"
+export AB_IDLE_TIMEOUT_SECONDS=0
 FAKE_BIN="$SUITE_TMP/bin"
 mkdir -p "$FAKE_BIN"
 
 SERVER_PID=""
 cleanup_suite() {
   [ -z "$SERVER_PID" ] || kill "$SERVER_PID" >/dev/null 2>&1 || true
-  rm -rf "$SUITE_TMP"
+  [ -z "$SERVER_PID" ] || wait "$SERVER_PID" 2>/dev/null || true
+  local log destination="/tmp/agent-browser-simplify-20261021/admin-stop-fixture-logs"
+  mkdir -p "$destination"
+  for log in "$SUITE_TMP"/*/commands.log*; do
+    [ -f "$log" ] || continue
+    mkdir -p "$destination/$(basename "$(dirname "$log")")"
+    cp "$log" "$destination/$(basename "$(dirname "$log")")/"
+  done
+  [ ! -f "$SUITE_TMP/fixture.log" ] || cp "$SUITE_TMP/fixture.log" "$destination/fixture.log"
+  rm -rf "$SUITE_TMP" "$SOCKET_TMP"
 }
 trap cleanup_suite EXIT INT TERM
 
@@ -23,6 +35,8 @@ trap cleanup_suite EXIT INT TERM
 # slow mock cases start.
 bash "$SKILL_DIR/tests/guard.sh"
 bash "$SKILL_DIR/tests/lib-interfaces.sh"
+node "$SKILL_DIR/tests/batch-check.mjs"
+node "$SKILL_DIR/tests/admin.mjs"
 
 fail() {
   printf 'not ok - %s\n' "$1" >&2
@@ -42,6 +56,13 @@ assert_file_contains() {
 }
 
 assert_file_not_contains() {
+  if [ "$1" = "${CASE_LOG:-}" ]; then
+    case "$2" in
+      " close"|"close") assert_socket_action close absent ;;
+      *"tab close"*) assert_socket_action tab_close absent ;;
+      *"network unroute"*) assert_socket_action unroute absent ;;
+    esac
+  fi
   if grep -Fq -- "$2" "$1"; then
     fail "$1 unexpectedly contains: $2"
   fi
@@ -51,22 +72,9 @@ assert_text_contains() {
   printf '%s' "$1" | grep -Fq -- "$2" || fail "output does not contain: $2"
 }
 
-cat > "$SUITE_TMP/server.mjs" <<'JS'
-import { writeFileSync } from "node:fs";
-import { createServer } from "node:net";
-
-// Deterministic TCP fixture: accept and hold connections so connect.sh sees an
-// open port without any HTTP or WebSocket behavior behind it.
-const server = createServer((socket) => socket.on("error", () => {}));
-server.listen(0, "127.0.0.1", () => {
-  writeFileSync(process.env.PORT_FILE, String(server.address().port));
-});
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
-JS
-
 command -v node >/dev/null 2>&1 || fail "node is required to run the deterministic TCP fixture"
 PORT_FILE="$SUITE_TMP/port"
-PORT_FILE="$PORT_FILE" node "$SUITE_TMP/server.mjs" >/dev/null 2>&1 &
+PORT_FILE="$PORT_FILE" node "$SKILL_DIR/tests/daemon-fixture.mjs" >"$SUITE_TMP/fixture.log" 2>&1 &
 SERVER_PID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -s "$PORT_FILE" ] && break
@@ -74,6 +82,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 [ -s "$PORT_FILE" ] || fail "TCP fixture did not start"
 PORT="$(cat "$PORT_FILE")"
+export MOCK_FIXTURE_PORT="$PORT" MOCK_FIXTURE_PID="$SERVER_PID"
+export MOCK_REGISTER="$SKILL_DIR/tests/daemon-register.mjs"
 DEFAULT_OWNER_KEY="$(ab_owner_key "01a06851-da51-7ccc-88df-b491dc5ee587" default "$PORT")"
 DEFAULT_SESSION="ab-${DEFAULT_OWNER_KEY:0:24}"
 
@@ -83,6 +93,9 @@ set -euo pipefail
 
 printf '%q ' "$@" >> "$MOCK_LOG"
 printf '\n' >> "$MOCK_LOG"
+printf '%s\t' "${AGENT_BROWSER_IDLE_TIMEOUT_MS:-unset}" >> "$MOCK_LOG.timeouts"
+printf '%q ' "$@" >> "$MOCK_LOG.timeouts"
+printf '\n' >> "$MOCK_LOG.timeouts"
 
 mkdir -p "$MOCK_STATE_DIR"
 if [ "${MOCK_MODE:-success}" = "stress-concurrency" ]; then
@@ -123,6 +136,14 @@ while [ "$#" -gt 0 ]; do
 done
 ACTION="${1:-}"
 [ "$#" -eq 0 ] || shift
+if [ -z "$CDP" ]; then
+  case "$ACTION:${1:-}" in
+    close:*|network:unroute|tab:*)
+      touch "$MOCK_LOG.forbidden-close"
+      echo "unexpected bare CLI administration: $ACTION ${1:-}" >&2
+      exit 97 ;;
+  esac
+fi
 
 mkdir -p "$MOCK_STATE_DIR" "$MOCK_SOCKET_DIR"
 ACTIVE_FILE="$MOCK_STATE_DIR/active"
@@ -138,14 +159,21 @@ EXTRA_TARGET_FILE="$MOCK_STATE_DIR/extra-target"
 SWAP_FILE="$MOCK_STATE_DIR/swap-tab"
 SWAP_BOUND_FILE="$MOCK_STATE_DIR/swap-bound-primary"
 
+register_fixture() {
+  node "$MOCK_REGISTER" "$1" "$SESSION" "${ARGS[@]}"
+}
+register_fixture cli
+
+
 ensure_target() {
-  [ -f "$TARGET_FILE" ] || printf 'TARGET-PRIMARY\n' > "$TARGET_FILE"
+  [ -f "$TARGET_FILE" ] || printf 'A1111111111111111111111111111111\n' > "$TARGET_FILE"
 }
 
 write_sidecars() {
   [ -n "$SESSION" ] || return
   printf 'binding\n' > "$MOCK_SOCKET_DIR/$SESSION.target"
   printf 'config\n' > "$MOCK_SOCKET_DIR/$SESSION.config"
+  register_fixture attachment
 }
 
 case "$ACTION" in
@@ -159,14 +187,23 @@ case "$ACTION" in
         echo "session daemon diagnostics failed" >&2
         exit 1
       fi
+      if [ -f "$MOCK_STATE_DIR/closing" ]; then
+        read -r REMAINING < "$MOCK_STATE_DIR/closing"
+        if [ "$REMAINING" -eq 0 ]; then
+          rm -f "$ACTIVE_FILE" "$MOCK_STATE_DIR/closing"
+        else
+          printf '%s\n' "$((REMAINING - 1))" > "$MOCK_STATE_DIR/closing"
+        fi
+      fi
+      register_fixture diagnostic
       if [ -f "$ACTIVE_FILE" ]; then
         PAGE_COUNT=1
         if [ -f "$DRIFTED_FILE" ] || [ -f "$EXTRA_TARGET_FILE" ]; then
           PAGE_COUNT=2
         fi
         [ ! -f "$TAB_CLOSED_FILE" ] || PAGE_COUNT=0
-        printf '{"data":{"active":true,"pid":4242,"runtime":{"browserLaunched":true,"pageCount":%s,"session":"%s","socketDir":"%s"},"session":"%s","socketDir":"%s","version":"%s"},"success":true}\n' \
-          "$PAGE_COUNT" "$SESSION" "$MOCK_SOCKET_DIR" "$SESSION" "$MOCK_SOCKET_DIR" "${MOCK_DAEMON_VERSION:-0.36.0}"
+        printf '{"data":{"active":true,"pid":%s,"runtime":{"browserLaunched":true,"pageCount":%s,"session":"%s","socketDir":"%s"},"session":"%s","socketDir":"%s","version":"%s"},"success":true}\n' \
+          "${MOCK_DAEMON_PID:-$MOCK_FIXTURE_PID}" "$PAGE_COUNT" "$SESSION" "$MOCK_SOCKET_DIR" "$SESSION" "$MOCK_SOCKET_DIR" "${MOCK_DAEMON_VERSION:-0.36.0}"
       else
         printf '{"data":{"active":false,"pid":null,"runtime":null,"session":"%s","socketDir":"%s","version":null},"success":true}\n' "$SESSION" "$MOCK_SOCKET_DIR"
       fi
@@ -177,10 +214,12 @@ case "$ACTION" in
     ;;
   get)
     [ "${1:-}" = "url" ] || exit 2
+    if [ "${MOCK_MODE:-success}" = "slow-action" ]; then sleep 3; fi
     touch "$ACTIVE_FILE"
     ensure_target
     write_sidecars
-    if [ "${MOCK_MODE:-success}" = "attach-fail" ]; then
+    if [ "${MOCK_MODE:-success}" = "attach-fail" ] || [ "${MOCK_MODE:-success}" = "attach-fail-close-no-exit" ]; then
+      [ "${MOCK_MODE:-success}" != "attach-fail-close-no-exit" ] || touch "$MOCK_STATE_DIR/replacement-failed"
       echo "WebSocket connection timed out while awaiting approval" >&2
       exit 1
     fi
@@ -237,7 +276,7 @@ case "$ACTION" in
         fi
         touch "$ACTIVE_FILE" "$REBOUND_FILE"
         rm -f "$TAB_CLOSED_FILE"
-        printf 'TARGET-RECOVERED\n' > "$TARGET_FILE"
+        printf 'C3333333333333333333333333333333\n' > "$TARGET_FILE"
         write_sidecars
         printf '%s\n' "${2:-about:blank}" > "$URL_FILE"
         echo "created"
@@ -251,16 +290,16 @@ case "$ACTION" in
           TAB_URL="$(cat "$URL_FILE" 2>/dev/null || printf 'about:blank')"
           if [ -f "$SWAP_FILE" ]; then
             if [ -f "$SWAP_BOUND_FILE" ]; then
-              printf '{"data":{"tabs":[{"active":true,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":false,"label":null,"tabId":"t2","targetId":"TARGET-SWAP","title":"New","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
+              printf '{"data":{"tabs":[{"active":true,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":false,"label":null,"tabId":"t2","targetId":"D4444444444444444444444444444444","title":"New","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
             else
-              printf '{"data":{"tabs":[{"active":false,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":true,"label":null,"tabId":"t2","targetId":"TARGET-SWAP","title":"New","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
+              printf '{"data":{"tabs":[{"active":false,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":true,"label":null,"tabId":"t2","targetId":"D4444444444444444444444444444444","title":"New","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
             fi
             exit 0
           fi
           if { [ "${MOCK_MODE:-success}" = "drift-before" ] && [ ! -f "$RESTORED_FILE" ]; } || [ -f "$DRIFTED_FILE" ]; then
-            printf '{"data":{"tabs":[{"active":false,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":true,"label":null,"tabId":"t2","targetId":"TARGET-FOREIGN","title":"Foreign","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
+            printf '{"data":{"tabs":[{"active":false,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":true,"label":null,"tabId":"t2","targetId":"B2222222222222222222222222222222","title":"Foreign","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
           elif [ -f "$EXTRA_TARGET_FILE" ]; then
-            printf '{"data":{"tabs":[{"active":true,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":false,"label":null,"tabId":"t2","targetId":"TARGET-FOREIGN","title":"Foreign","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
+            printf '{"data":{"tabs":[{"active":true,"label":null,"tabId":"t1","targetId":"%s","title":"Owned","type":"page","url":"%s"},{"active":false,"label":null,"tabId":"t2","targetId":"B2222222222222222222222222222222","title":"Foreign","type":"page","url":"about:blank"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
           else
             printf '{"data":{"tabs":[{"active":true,"label":null,"tabId":"t1","targetId":"%s","title":"Test","type":"page","url":"%s"}]},"success":true}\n' "$TARGET_ID" "$TAB_URL"
           fi
@@ -268,7 +307,7 @@ case "$ACTION" in
         ;;
       close)
         [ -f "$ACTIVE_FILE" ] || exit 1
-        if [ "${2:-}" = "TARGET-SWAP" ] && [ -f "$SWAP_FILE" ]; then
+        if [ "${2:-}" = "D4444444444444444444444444444444" ] && [ -f "$SWAP_FILE" ]; then
           rm -f "$SWAP_FILE" "$SWAP_BOUND_FILE"
           echo "closed"
           exit 0
@@ -276,7 +315,7 @@ case "$ACTION" in
         touch "$TAB_CLOSED_FILE"
         echo "closed"
         ;;
-      TARGET-*)
+      [A-F0-9][A-F0-9]*)
         if [ -f "$SWAP_FILE" ] && [ "$1" = "$(cat "$TARGET_FILE" 2>/dev/null || true)" ]; then
           touch "$SWAP_BOUND_FILE"
           echo '{"data":{"switched":true},"success":true}'
@@ -293,28 +332,22 @@ case "$ACTION" in
   batch)
     touch "$ACTIVE_FILE"
     ensure_target
-    # Record whatever arrived on stdin. Argument-mode batch now re-encodes the
-    # guarded words to the JSON stdin form, so the test can assert that what the
-    # guard checked is what the CLI was handed.
     [ -t 0 ] || cat > "$MOCK_STATE_DIR/batch-stdin" 2>/dev/null || true
     echo "batched"
+    ;;
+  react)
+    printf '{"success":true,"data":{}}\n'
     ;;
   network)
     [ "${1:-}" = "unroute" ] || exit 2
     [ -f "$ACTIVE_FILE" ] || exit 1
+    [ "${MOCK_MODE:-success}" != "unroute-fail" ] || exit 1
     echo "unrouted"
     ;;
   close)
-    if [ "${MOCK_MODE:-success}" = "attach-hang" ] && [ -f "$MOCK_SOCKET_DIR/$SESSION.pid" ]; then
-      while kill -0 "$(cat "$MOCK_SOCKET_DIR/$SESSION.pid")" 2>/dev/null; do sleep 0.2; done
-    fi
-    if [ "${MOCK_MODE:-success}" = "close-fail" ]; then
-      echo "daemon refused to stop" >&2
-      exit 1
-    fi
-    [ "${MOCK_MODE:-success}" != "swap-new-tab" ] || touch "$SWAP_FILE"
-    rm -f "$ACTIVE_FILE"
-    echo "closed"
+    echo "forbidden bare CLI CLOSE" >&2
+    touch "$MOCK_LOG.forbidden-close"
+    exit 91
     ;;
   *)
     echo "unsupported mock command: $ACTION" >&2
@@ -343,7 +376,7 @@ chmod +x "$FAKE_BIN/osascript"
 cat > "$FAKE_BIN/lsof" <<'MOCK'
 #!/usr/bin/env bash
 if [ "${MOCK_LSOF_LIVE:-0}" = "1" ]; then
-  printf 'agent-bro 4242 user 10u IPv4 TCP 127.0.0.1:54000->127.0.0.1:%s (ESTABLISHED)\n' "$MOCK_PORT"
+  printf 'agent-bro %s user 10u IPv4 TCP 127.0.0.1:54000->127.0.0.1:%s (ESTABLISHED)\n' "$MOCK_FIXTURE_PID" "$MOCK_PORT"
   exit 0
 fi
 exit 1
@@ -351,14 +384,27 @@ MOCK
 chmod +x "$FAKE_BIN/lsof"
 
 new_case() {
+  [ ! -f "${CASE_LOG:-/dev/null}.forbidden-close" ] || fail "forbidden bare CLI CLOSE was attempted"
   CASE_DIR="$SUITE_TMP/$1"
   CASE_STATE="$CASE_DIR/state"
-  CASE_SOCKET="$CASE_DIR/socket"
+  CASE_NUMBER=$((CASE_NUMBER + 1))
+  CASE_SOCKET="$SOCKET_TMP/$CASE_NUMBER"
   CASE_ROOT="$CASE_DIR/wrappers"
   CASE_CHROME="$CASE_DIR/chrome"
   CASE_LOG="$CASE_DIR/commands.log"
   mkdir -p "$CASE_STATE" "$CASE_SOCKET" "$CASE_ROOT" "$CASE_CHROME" "$CASE_DIR/home"
+  chmod 700 "$CASE_SOCKET"
   : > "$CASE_LOG"
+  : > "$CASE_LOG.events"
+  : > "$CASE_LOG.events"
+}
+
+assert_socket_action() {
+  node "$SKILL_DIR/tests/daemon-events.mjs" "$CASE_LOG.events" "$1" "${2:-present}" || fail "socket $1 assertion failed"
+}
+
+assert_socket_order() {
+  node "$SKILL_DIR/tests/daemon-events.mjs" "$CASE_LOG.events" order "$1" "$2" || fail "native timeout socket ordering failed"
 }
 
 run_connect() {
@@ -389,6 +435,7 @@ run_cleanup() {
   local close_tab="${4:-0}"
   local cleanup_args=("$session")
   [ "$close_tab" -eq 0 ] || cleanup_args=(--close-tab "$session")
+  [ "$#" -le 4 ] || cleanup_args+=("${@:5}")
   env -u AB_CDP_WS_URL -u AB_DEVTOOLS_ACTIVE_PORT_FILE \
     PATH="$FAKE_BIN:$ORIGINAL_PATH" \
     HOME="$CASE_DIR/home" \
@@ -452,6 +499,10 @@ assert_wrapper_rejected() {
   assert_eq "$calls_after" "$calls_before"
 }
 
+# Conversation lifecycle regressions use these same mock helpers.
+# shellcheck source=lifecycle-cases.sh
+. "$SKILL_DIR/tests/lifecycle-cases.sh"
+
 # Exact endpoint selection, one initial attach, and stable owner identity across labels.
 new_case exact
 mkdir -p "$CASE_CHROME/Default"
@@ -467,7 +518,7 @@ assert_eq "$(LC_ALL=C ls -l "$AB" | cut -c1-10)" "-rwx------"
 assert_eq "$(LC_ALL=C ls -l "$CASE_ROOT/$SESSION/session.meta" | cut -c1-10)" "-rw-------"
 assert_file_contains "$AB" "dispatch.sh"
 assert_file_contains "$CASE_ROOT/$SESSION/session.meta" "cdp_url=ws://127.0.0.1:$PORT/devtools/browser/exact-uuid"
-assert_file_contains "$CASE_ROOT/$SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$SESSION/session.meta" "owned_target_id=A1111111111111111111111111111111"
 assert_file_not_contains "$AB" "--cdp $PORT"
 assert_text_contains "$OUTPUT" "Session:  $SESSION"
 CDP_CALLS="$(grep -c -- '--cdp' "$CASE_LOG" || true)"
@@ -478,23 +529,18 @@ assert_text_contains "$SECOND_OUTPUT" "Session:  $SESSION"
 WRAPPED_OUTPUT="$(run_wrapper success "$AB" get url)"
 assert_eq "$WRAPPED_OUTPUT" "http://example.test"
 assert_wrapper_rejected "$AB" tab new http://forbidden.test
-assert_wrapper_rejected "$AB" tab TARGET-FOREIGN
+assert_wrapper_rejected "$AB" tab B2222222222222222222222222222222
 assert_wrapper_rejected "$AB" window new
 assert_wrapper_rejected "$AB" bringtofront
-assert_wrapper_rejected "$AB" batch 'get url' 'bringtofront'
 assert_wrapper_rejected "$AB" inspect
 assert_wrapper_rejected "$AB" record start /tmp/demo.webm
 assert_wrapper_rejected "$AB" record restart /tmp/demo.webm http://example.test
-assert_wrapper_rejected "$AB" batch 'get url' 'record start /tmp/demo.webm'
 assert_wrapper_rejected "$AB" click @e1 --new-tab
 assert_wrapper_rejected "$AB" click @e1 --new-tab=true
-assert_wrapper_rejected "$AB" batch 'tab new http://forbidden.test'
-assert_wrapper_rejected "$AB" batch "t'ab' new http://forbidden.test"
 assert_wrapper_rejected "$AB" get url --session foreign
 assert_wrapper_rejected "$AB" --enable react-devtools open http://example.test
 assert_wrapper_rejected "$AB" open http://example.test --enable=react-devtools
 assert_wrapper_rejected "$AB" --input-mode human click @e1
-assert_wrapper_rejected "$AB" batch 'get url' 'open http://example.test --enable react-devtools' 
 assert_wrapper_rejected "$AB" --json tab new http://forbidden.test
 assert_wrapper_rejected "$AB" tab list new http://forbidden.test
 assert_wrapper_rejected "$AB" press Meta+t
@@ -507,41 +553,12 @@ assert_wrapper_rejected "$AB" removeinitscript 3
 assert_wrapper_rejected "$AB" open http://example.test --proxy http://evil.test
 assert_wrapper_rejected "$AB" open http://example.test --extension /tmp/ext
 assert_wrapper_rejected "$AB" keydown Meta
-assert_wrapper_rejected "$AB" batch '' 'get url'
 UNKNOWN_OUTPUT="$(assert_wrapper_status "$AB" 10 totallynewverb)"
 assert_text_contains "$UNKNOWN_OUTPUT" "not in this wrapper allow-list"
 assert_text_contains "$UNKNOWN_OUTPUT" "Report to the user"
 UNKNOWN_OUTPUT="$(assert_wrapper_status "$AB" 10 snapshot --brand-new-flag)"
 assert_text_contains "$UNKNOWN_OUTPUT" "not in this wrapper allow-list"
-BATCH_OUTPUT="$(run_wrapper success "$AB" batch 'get url' 'snapshot -i')"
-assert_eq "$BATCH_OUTPUT" "batched"
-# C4: the words the guard checked are the words the CLI runs. Argument mode now
-# re-encodes to the JSON stdin form instead of handing back the original string
-# for a second, differently-behaved parser to split.
-assert_file_contains "$CASE_STATE/batch-stdin" '[["get","url"],["snapshot","-i"]]'
-assert_file_not_contains "$CASE_LOG" "snapshot\\ -i"
-# A tab inside an argument stays one word end to end. json.mjs does not split on
-# it, so a downstream whitespace splitter must never get the chance to.
-rm -f "$CASE_STATE/batch-stdin"
-BATCH_OUTPUT="$(run_wrapper success "$AB" batch "$(printf 'fill @e1 hello\tworld')")"
-assert_eq "$BATCH_OUTPUT" "batched"
-assert_file_contains "$CASE_STATE/batch-stdin" '[["fill","@e1","hello\tworld"]]'
-# --bail stays a CLI flag; it is not smuggled into the command array.
-rm -f "$CASE_STATE/batch-stdin"
-BATCH_OUTPUT="$(run_wrapper success "$AB" batch --bail 'get url')"
-assert_eq "$BATCH_OUTPUT" "batched"
-assert_file_contains "$CASE_STATE/batch-stdin" '[["get","url"]]'
-assert_file_contains "$CASE_LOG" "--bail"
-BATCH_OUTPUT="$(printf '[["snapshot","-i"],["fill","@e2","hello world"]]' | run_wrapper success "$AB" batch)"
-assert_eq "$BATCH_OUTPUT" "batched"
-CALLS_BEFORE_STDIN_REJECT="$(wc -l < "$CASE_LOG" | tr -d ' ')"
-set +e
-BATCH_OUTPUT="$(printf '[["snapshot","-i"],["tab","new","http://forbidden.test"]]' | run_wrapper success "$AB" batch 2>&1)"
-STATUS=$?
-set -e
-assert_eq "$STATUS" "2"
-assert_text_contains "$BATCH_OUTPUT" "blocked"
-assert_eq "$(wc -l < "$CASE_LOG" | tr -d ' ')" "$CALLS_BEFORE_STDIN_REJECT"
+. "$SKILL_DIR/tests/batch-cases.sh"
 CALLS_BEFORE_OUTDATED="$(wc -l < "$CASE_LOG" | tr -d ' ')"
 ab_set_meta_value "$CASE_ROOT/$SESSION/session.meta" version 2
 set +e
@@ -602,6 +619,7 @@ printf '%s\n/devtools/browser/drift-before-uuid\n' "$PORT" > "$CASE_CHROME/DevTo
 run_connect success drift --session driftbefore >/dev/null
 AB="$CASE_ROOT/driftbefore/ab"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(run_wrapper drift-before "$AB" get url 2>&1)"
 STATUS=$?
@@ -609,7 +627,7 @@ set -e
 assert_eq "$STATUS" "0"
 assert_text_contains "$OUTPUT" "drifted; restored the owned target before running"
 assert_text_contains "$OUTPUT" "about:blank"
-RESTORE_LINE="$(grep -n -- 'tab TARGET-PRIMARY' "$CASE_LOG" | head -n 1 | cut -d: -f1)"
+RESTORE_LINE="$(grep -n -- 'tab A1111111111111111111111111111111' "$CASE_LOG" | head -n 1 | cut -d: -f1)"
 COMMAND_LINE="$(grep -n -- 'get url' "$CASE_LOG" | head -n 1 | cut -d: -f1)"
 [ -n "$RESTORE_LINE" ] || fail "dispatcher did not restore the drifted binding"
 [ -n "$COMMAND_LINE" ] || fail "dispatcher did not run the command after restoring"
@@ -624,14 +642,15 @@ pass "pre-command binding drift correction proceeds"
 new_case reconnect-drifted
 printf '%s\n/devtools/browser/reconnect-drifted-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success first --session redrift >/dev/null
-assert_file_contains "$CASE_ROOT/redrift/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/redrift/session.meta" "owned_target_id=A1111111111111111111111111111111"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 OUTPUT="$(run_connect drift-before second --session redrift --url http://second.test 2>&1)"
 assert_text_contains "$OUTPUT" "drifted to another tab; switched back to the owned target"
 assert_text_contains "$OUTPUT" "Own tab:  http://second.test"
-assert_file_contains "$CASE_ROOT/redrift/session.meta" "owned_target_id=TARGET-PRIMARY"
-assert_file_not_contains "$CASE_ROOT/redrift/session.meta" "TARGET-FOREIGN"
-REBIND_LINE="$(grep -n -- 'tab TARGET-PRIMARY' "$CASE_LOG" | head -n 1 | cut -d: -f1)"
+assert_file_contains "$CASE_ROOT/redrift/session.meta" "owned_target_id=A1111111111111111111111111111111"
+assert_file_not_contains "$CASE_ROOT/redrift/session.meta" "B2222222222222222222222222222222"
+REBIND_LINE="$(grep -n -- 'tab A1111111111111111111111111111111' "$CASE_LOG" | head -n 1 | cut -d: -f1)"
 NAVIGATE_LINE="$(grep -n -- 'open http://second.test' "$CASE_LOG" | head -n 1 | cut -d: -f1)"
 [ -n "$REBIND_LINE" ] || fail "reconnect did not switch back to the owned target"
 [ -n "$NAVIGATE_LINE" ] || fail "reconnect did not navigate after rebinding"
@@ -646,6 +665,7 @@ printf '%s\n/devtools/browser/drift-after-uuid\n' "$PORT" > "$CASE_CHROME/DevToo
 run_connect success drift --session driftafter >/dev/null
 AB="$CASE_ROOT/driftafter/ab"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(run_wrapper drift-after "$AB" open http://drifted.test 2>&1)"
 STATUS=$?
@@ -653,7 +673,7 @@ set -e
 assert_eq "$STATUS" "9"
 assert_text_contains "$OUTPUT" "changed the browser binding unexpectedly"
 assert_file_contains "$CASE_LOG" "open http://drifted.test"
-assert_file_contains "$CASE_LOG" "tab TARGET-PRIMARY"
+assert_file_contains "$CASE_LOG" "tab A1111111111111111111111111111111"
 pass "post-command binding drift correction"
 
 # Missing standard endpoint falls back to one direct generic WebSocket URL.
@@ -737,10 +757,10 @@ assert_eq "$STATUS" "5"
 assert_text_contains "$OUTPUT" "single CDP connection did not complete"
 CDP_CALLS="$(grep -c -- '--cdp' "$CASE_LOG" || true)"
 assert_eq "$CDP_CALLS" "1"
-CLOSE_LINE="$(grep 'close ' "$CASE_LOG" | tail -n 1)"
-if printf '%s' "$CLOSE_LINE" | grep -Fq -- '--cdp'; then
-  fail "rollback close attempted a new CDP connection"
-fi
+assert_socket_action close 1
+[ ! -f "$CASE_STATE/active" ] || fail "failed attachment daemon survived socket close"
+assert_file_not_contains "$CASE_LOG" " close "
+
 [ ! -e "$CASE_ROOT/failcase" ] || fail "failed wrapper directory leaked"
 [ ! -e "$CASE_SOCKET/failcase.target" ] || fail "failed target binding leaked"
 [ ! -e "$CASE_SOCKET/failcase.config" ] || fail "failed config sidecar leaked"
@@ -750,13 +770,15 @@ pass "single-attempt failure and transactional rollback"
 new_case empty-url
 printf '%s\n/devtools/browser/empty-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 set +e
-OUTPUT="$(run_connect empty-url empty --session emptycase 2>&1)"
+OUTPUT="$(MOCK_LSOF_LIVE=1 MOCK_PORT="$PORT" run_connect empty-url empty --session emptycase 2>&1)"
 STATUS=$?
 set -e
 assert_eq "$STATUS" "5"
 assert_text_contains "$OUTPUT" "returned no bound-tab URL"
-assert_file_contains "$CASE_LOG" "tab close"
-assert_file_not_contains "$CASE_LOG" "--cdp ws://127.0.0.1:$PORT/devtools/browser/empty-uuid --pin-tab --session emptycase tab close"
+assert_socket_action tab_close 1
+assert_file_contains "$CASE_LOG.events" '"targetId":"A1111111111111111111111111111111"'
+[ -f "$CASE_STATE/tab-closed" ] || fail "rollback did not close the new target"
+[ ! -f "$CASE_STATE/active" ] || fail "rollback left the daemon active"
 [ ! -e "$CASE_ROOT/emptycase" ] || fail "post-attach rollback leaked its wrapper"
 pass "post-attach tab rollback"
 
@@ -780,6 +802,7 @@ STATUS=$?
 set -e
 assert_eq "$STATUS" "5"
 assert_text_contains "$OUTPUT" "could not replace the closed pinned tab"
+assert_socket_action tab_close absent
 if grep -Fq -- 'tab close' "$CASE_LOG"; then
   fail "failed tab_gone replacement guessed a target during rollback"
 fi
@@ -795,6 +818,7 @@ OUTPUT="$(run_connect attach-fail existing --session existing 2>&1)"
 STATUS=$?
 set -e
 assert_eq "$STATUS" "5"
+assert_socket_action close absent
 if grep -Eq -- '(^| )close ' "$CASE_LOG"; then
   fail "pre-existing active session was closed during rollback"
 fi
@@ -807,11 +831,13 @@ new_case cleanup-live
 printf '%s\n/devtools/browser/cleanup-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success cleanup --session cleanlive >/dev/null
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 OUTPUT="$(run_cleanup 1 cleanlive)"
 assert_text_contains "$OUTPUT" "pinned tab preserved"
-assert_file_contains "$CASE_LOG" "network unroute"
+assert_socket_action unroute absent
+assert_socket_action tab_list absent
 assert_file_not_contains "$CASE_LOG" "tab close"
-assert_file_contains "$CASE_LOG" "close"
+assert_socket_action close 1
 assert_file_not_contains "$CASE_LOG" "--cdp"
 [ ! -e "$CASE_ROOT/cleanlive" ] || fail "cleanup wrapper directory leaked"
 [ ! -e "$CASE_SOCKET/cleanlive.target" ] || fail "cleanup target binding leaked"
@@ -823,10 +849,12 @@ new_case cleanup-close-tab
 printf '%s\n/devtools/browser/cleanup-close-tab-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success cleanup --session closeowned >/dev/null
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 OUTPUT="$(run_cleanup 1 closeowned success 1)"
 assert_text_contains "$OUTPUT" "pinned tab closed"
-assert_file_contains "$CASE_LOG" "network unroute"
-assert_file_contains "$CASE_LOG" "tab close TARGET-PRIMARY"
+assert_socket_action unroute 1
+assert_socket_action tab_close 1
+assert_file_contains "$CASE_LOG.events" '"tabId":"A1111111111111111111111111111111"'
 assert_file_not_contains "$CASE_LOG" "--cdp"
 pass "explicit close-tab closes only the owned target"
 
@@ -836,12 +864,14 @@ printf '%s\n/devtools/browser/tampered-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsA
 run_connect success cleanup --session tampered >/dev/null
 ab_set_meta_value "$CASE_ROOT/tampered/session.meta" session foreign
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(run_cleanup 1 tampered success 1 2>&1)"
 STATUS=$?
 set -e
 assert_eq "$STATUS" "6"
 assert_text_contains "$OUTPUT" "does not prove exact target ownership"
+assert_socket_action tab_close absent
 if grep -Fq -- 'tab close' "$CASE_LOG"; then
   fail "cleanup closed a target using inconsistent ownership metadata"
 fi
@@ -861,6 +891,7 @@ assert_text_contains "$OUTPUT" "additional page"
 assert_file_not_contains "$CASE_ROOT/popupcase/session.meta" "unattributed_target_events"
 assert_file_not_contains "$CASE_ROOT/popupcase/session.meta" "last_observed_target_count"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 OUTPUT="$(run_cleanup 1 popupcase 2>&1)"
 assert_text_contains "$OUTPUT" "pinned tab preserved"
 assert_file_not_contains "$CASE_LOG" "tab close"
@@ -871,6 +902,7 @@ new_case cleanup-close-fail
 printf '%s\n/devtools/browser/close-fail-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success cleanup --session closefail >/dev/null
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(run_cleanup 1 closefail close-fail 2>&1)"
 STATUS=$?
@@ -917,6 +949,7 @@ new_case cleanup-disconnected
 printf '%s\n/devtools/browser/disconnected-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success cleanup --session disconnected >/dev/null
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(run_cleanup 0 disconnected success 1 2>&1)"
 STATUS=$?
@@ -924,10 +957,11 @@ set -e
 assert_eq "$STATUS" "6"
 assert_text_contains "$OUTPUT" "will not open a new approval"
 assert_file_not_contains "$CASE_LOG" "--cdp"
+assert_socket_action tab_close absent
 if grep -Fq -- 'tab close' "$CASE_LOG"; then
   fail "disconnected cleanup attempted a browser command"
 fi
-assert_file_contains "$CASE_LOG" "close"
+assert_socket_action close 1
 [ ! -e "$CASE_ROOT/disconnected" ] || fail "disconnected wrapper directory leaked"
 pass "disconnected cleanup avoids approval"
 
@@ -1031,10 +1065,11 @@ assert_eq "$MATCHED_OUTPUT" "http://example.test"
 # version. The session sidecars survive so the new daemon rebinds to the same
 # target instead of opening another tab.
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 MISMATCH_CONNECT="$(MOCK_DAEMON_VERSION=0.37.1 run_connect success "Upgrade case" 2>&1)"
 assert_text_contains "$MISMATCH_CONNECT" "Stopping the stale daemon"
 assert_text_contains "$MISMATCH_CONNECT" "Session:  $DEFAULT_SESSION"
-grep -q -- "--session $DEFAULT_SESSION close" "$CASE_LOG" || fail "connect did not stop the stale daemon"
+assert_socket_action close 1
 [ -f "$CASE_SOCKET/$DEFAULT_SESSION.target" ] || fail "connect removed the binding sidecar"
 POST_OUTPUT="$(run_wrapper success "$AB" get url)"
 assert_eq "$POST_OUTPUT" "http://example.test"
@@ -1047,15 +1082,16 @@ pass "upgraded CLI never restarts a stale daemon mid-command"
 new_case version-mismatch-tab
 printf '%s\n/devtools/browser/swap-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success "Swap case" --url http://example.test >/dev/null
-assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=A1111111111111111111111111111111"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 SWAP_OUTPUT="$(MOCK_DAEMON_VERSION=0.37.1 run_connect swap-new-tab "Swap case" 2>&1)"
 assert_text_contains "$SWAP_OUTPUT" "Stopping the stale daemon"
 assert_text_contains "$SWAP_OUTPUT" "switched back to this session's own tab"
 assert_text_contains "$SWAP_OUTPUT" "Own tab:  http://example.test"
-grep -q -- "tab close TARGET-SWAP" "$CASE_LOG" || fail "the empty tab from the swap attach was not closed"
+grep -q -- "tab close D4444444444444444444444444444444" "$CASE_LOG" || fail "the empty tab from the swap attach was not closed"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "tab-closed reason=daemon-swap"
-assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=A1111111111111111111111111111111"
 pass "a daemon swap leaves no extra tab behind"
 
 # --persistent: the wrapper re-runs connect.sh by itself on a recoverable
@@ -1083,8 +1119,8 @@ assert_file_contains "$CASE_DIR/heal.err" "persistent mode is reconnecting"
 assert_file_contains "$CASE_DIR/heal.err" "Reconnected; own tab: http://example.test"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-start reason=daemon-inactive"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-ok reason=daemon-inactive"
-assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "attach mode=rebound (new daemon, same tab TARGET-PRIMARY)"
-assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "attach mode=rebound (new daemon, same tab A1111111111111111111111111111111)"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=A1111111111111111111111111111111"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "persistent=1"
 TAB_NEW_CALLS="$(grep -c -- 'tab new' "$CASE_LOG" || true)"
 assert_eq "$TAB_NEW_CALLS" "0"
@@ -1099,6 +1135,7 @@ AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "persistent=0"
 rm -f "$CASE_STATE/active"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(heal_env run_wrapper success "$AB" get url 2>&1)"
 STATUS=$?
@@ -1115,9 +1152,10 @@ new_case persistent-tab-gone
 printf '%s\n/devtools/browser/persist-gone-uuid\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 run_connect success "Gone case" --persistent --session persistgone --url http://example.test >/dev/null
 AB="$CASE_ROOT/persistgone/ab"
-printf '{"targetId":"TARGET-PRIMARY","url":"http://last.test/page","pinned":true}\n' > "$CASE_SOCKET/persistgone.target"
+printf '{"targetId":"A1111111111111111111111111111111","url":"http://last.test/page","pinned":true}\n' > "$CASE_SOCKET/persistgone.target"
 touch "$CASE_STATE/tab-closed"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(heal_env run_wrapper tab-gone "$AB" get url 2>"$CASE_DIR/heal.err")"
 STATUS=$?
@@ -1127,7 +1165,7 @@ assert_eq "$OUTPUT" "http://last.test/page"
 grep -Fq -- 'tab new http://last.test/page' "$CASE_LOG" || fail "the replacement tab did not reopen at the last URL"
 assert_eq "$(grep -c -- 'tab new' "$CASE_LOG" || true)" "1"
 assert_file_contains "$CASE_ROOT/persistgone/events.log" "heal-ok reason=target-gone"
-assert_file_contains "$CASE_ROOT/persistgone/session.meta" "owned_target_id=TARGET-RECOVERED"
+assert_file_contains "$CASE_ROOT/persistgone/session.meta" "owned_target_id=C3333333333333333333333333333333"
 pass "persistent mode replaces a closed tab at its last URL (explicit session)"
 
 # A failed heal is not retried within the cooldown, so an unapproved dialog can
@@ -1146,9 +1184,10 @@ assert_text_contains "$OUTPUT" "persistent mode is reconnecting"
 assert_text_contains "$OUTPUT" "single CDP connection did not complete"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-failed reason=daemon-inactive status=5"
 [ -f "$CASE_SOCKET/$DEFAULT_SESSION.target" ] || fail "a failed heal removed the rebind sidecar"
-assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=A1111111111111111111111111111111"
 [ -x "$AB" ] || fail "a failed heal removed the wrapper"
 : > "$CASE_LOG"
+: > "$CASE_LOG.events"
 set +e
 OUTPUT="$(heal_env run_wrapper attach-fail "$AB" get url 2>&1)"
 STATUS=$?
@@ -1187,7 +1226,7 @@ assert_text_contains "$OUTPUT" "No connection within 2s"
 assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "heal-failed reason=daemon-inactive"
 # The rollback ran to completion: the owned target survived in session.meta and
 # no backup was left behind, which only happens if the blocked daemon was stopped.
-assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=TARGET-PRIMARY"
+assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/session.meta" "owned_target_id=A1111111111111111111111111111111"
 if ls "$CASE_ROOT/$DEFAULT_SESSION/" | grep -q backup; then
   fail "a timed-out heal left rollback backups behind"
 fi
@@ -1229,7 +1268,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   fi
   MOCK_LSOF_LIVE=0 MOCK_PORT="$PORT" run_wrapper success "$AB" get url >/dev/null 2>&1 || fail "wrapped command failed"
   grep -q 'osascript.* approve ' "$CASE_LOG" || fail "the approver did not cover the daemon's redial"
-  assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "socket-down pid=4242"
+  assert_file_contains "$CASE_ROOT/$DEFAULT_SESSION/events.log" "socket-down pid=$SERVER_PID"
   pass "auto-approve covers a dropped socket's redial and nothing else"
 
   new_case auto-approve-foreign
@@ -1281,4 +1320,5 @@ for SIDECAR_CASE in \
 done
 pass "sidecar URL reader rejects unsafe replacement URLs"
 
+[ ! -f "$CASE_LOG.forbidden-close" ] || fail "forbidden bare CLI CLOSE was attempted"
 printf '\nAll agent-browser-connect helper tests passed.\n'

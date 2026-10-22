@@ -11,6 +11,7 @@ const page = `<!doctype html>
   <head><meta charset="utf-8"><title>Containment test</title></head>
   <body>
     <h1>Containment test</h1>
+    <input id="batch-input" aria-label="Batch input">
     <a id="blank-link" href="/popup" target="_blank">Open tab</a>
     <button id="popup-button" type="button" onclick="window.open('/popup', '_blank', 'popup,width=420,height=320')">Open popup</button>
   </body>

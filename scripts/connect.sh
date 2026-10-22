@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib.sh"
 
 usage() {
-  echo "usage: connect.sh [label] [--url <url>] [--port 9222] [--session <existing>] [--slot <name>] [--react] [--persistent] [--auto-approve]" >&2
+  echo "usage: connect.sh [label] [--url <url>] [--port 9222] [--session <existing>] [--slot <name>] [--[no-]react] [--[no-]persistent] [--[no-]auto-approve] [--idle-timeout <seconds>]" >&2
 }
 
 die_usage() {
@@ -22,16 +22,20 @@ LABEL=""
 URL=""
 REUSE="${AB_SESSION_ID:-}"
 SLOT="default"
-REACT_HOOK=0
-PERSISTENT=0
-AUTO_APPROVE=0
+# Empty means inherit, not disable. User-approved policy belongs to the owner
+# session, not to the particular task that happens to call connect again.
+REQUEST_REACT=""
+REQUEST_PERSISTENT=""
+REQUEST_AUTO_APPROVE=""
+REQUEST_IDLE_TIMEOUT=""
 # Internal: the dispatcher passes the URL a closed tab last had, so a persistent
 # heal reopens it there. Unlike --url it never navigates a tab that survived.
 REPLACE_URL=""
+RECOVER=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --url|--port|--session|--slot|--replace-url)
+    --url|--port|--session|--slot|--replace-url|--idle-timeout)
       [ "$#" -ge 2 ] || die_usage "$1 requires a value"
       case "$1" in
         --url) URL="$2" ;;
@@ -39,21 +43,28 @@ while [ "$#" -gt 0 ]; do
         --port) PORT_RAW="$2" ;;
         --session) REUSE="$2" ;;
         --slot) SLOT="$2" ;;
+        --idle-timeout)
+          REQUEST_IDLE_TIMEOUT="$(ab_normalize_idle_timeout "$2")" || die_usage "idle timeout must be an integer from 0 to 2147483647 seconds"
+          ;;
       esac
       shift 2
       ;;
+    --recover) RECOVER=1; shift ;;
     --react)
-      REACT_HOOK=1
+      REQUEST_REACT=1
       shift
       ;;
     --persistent)
-      PERSISTENT=1
+      REQUEST_PERSISTENT=1
       shift
       ;;
     --auto-approve)
-      AUTO_APPROVE=1
+      REQUEST_AUTO_APPROVE=1
       shift
       ;;
+    --no-react) REQUEST_REACT=0; shift ;;
+    --no-persistent) REQUEST_PERSISTENT=0; shift ;;
+    --no-auto-approve) REQUEST_AUTO_APPROVE=0; shift ;;
     -h|--help)
       usage
       exit 0
@@ -73,6 +84,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$RECOVER" -eq 1 ] && { [ -n "$REQUEST_PERSISTENT" ] || [ -n "$REQUEST_REACT" ] \
+  || [ -n "$REQUEST_AUTO_APPROVE" ] || [ -n "$REQUEST_IDLE_TIMEOUT" ]; }; then
+  die_usage "internal recovery cannot request policy changes"
+fi
+
 case "$URL" in
   -*) die_usage "URL values may not begin with '-'" ;;
 esac
@@ -91,9 +107,7 @@ esac
 # on every page profiled that way. Through 0.37.1 each of those sockets also
 # stayed established; 0.38 closes the old one (upstream #1739), so the cost
 # today is the dialog, not the leak.
-if [ "$REACT_HOOK" -eq 1 ]; then
-  export AGENT_BROWSER_ENABLE="react-devtools"
-fi
+# Exported below, after resolving the saved session policy.
 
 AGENT_BROWSER_BIN="$(command -v agent-browser 2>/dev/null || true)"
 if [ -z "$AGENT_BROWSER_BIN" ] || [ "${AGENT_BROWSER_BIN#/}" = "$AGENT_BROWSER_BIN" ] || [ ! -x "$AGENT_BROWSER_BIN" ]; then
@@ -213,7 +227,7 @@ AB="$DIR/ab"
 META="$DIR/session.meta"
 DIR_EXISTED=0
 [ -d "$DIR" ] && [ ! -L "$DIR" ] && DIR_EXISTED=1
-if ! ab_prepare_private_dir "$DIR"; then
+if { [ -e "$DIR" ] || [ -L "$DIR" ]; } && ! ab_owned_directory "$DIR"; then
   echo "✗ Session wrapper path is unsafe or not owned by this user: $DIR" >&2
   exit 5
 fi
@@ -232,6 +246,52 @@ fi
 # to the user or to another agent, and navigating it would hijack their page.
 PREV_OWNED_TARGET_ID="$(ab_meta_value "$META" owned_target_id 2>/dev/null || true)"
 [[ "$PREV_OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]] || PREV_OWNED_TARGET_ID=""
+
+SETTINGS_META=/dev/null
+if ab_load_meta "$META" "$SESSION" 0 && [ "$AB_META_OWNER_KEY" = "$OWNER_KEY" ]; then
+  SETTINGS_META="$META"
+fi
+if [ "$RECOVER" -eq 1 ] && [ "$SETTINGS_META" = /dev/null ]; then
+  echo "✗ Recovery requires current metadata proving this browser owner; no connection was attempted." >&2
+  exit 5
+fi
+if [ "$RECOVER" -eq 1 ] && ab_native_migration_required "$META"; then
+  echo "✗ Recovery requires explicit connect to migrate idle configuration; no connection was attempted." >&2
+  exit 8
+fi
+ab_configure_policy "$SETTINGS_META" "$REQUEST_PERSISTENT" "$REQUEST_REACT" "$REQUEST_AUTO_APPROVE" "$REQUEST_IDLE_TIMEOUT" || exit $?
+if [ "$RECOVER" -eq 1 ] && [ "$AB_POLICY_PERSISTENT" != 1 ]; then
+  echo "✗ Persistent recovery was revoked; no connection was attempted." >&2
+  exit 5
+fi
+# A released owner must not be recreated by a pending recovery.
+if ! ab_prepare_private_dir "$DIR"; then
+  echo "✗ Session wrapper path is unsafe or not owned by this user: $DIR" >&2
+  exit 5
+fi
+if [ "$AB_POLICY_REACT" -eq 1 ]; then
+  export AGENT_BROWSER_ENABLE="react-devtools"
+else
+  unset AGENT_BROWSER_ENABLE
+fi
+
+DESIRED_IDLE_TIMEOUT_MS="$AGENT_BROWSER_IDLE_TIMEOUT_MS"
+PRE_TRANSITION_IDLE_TIMEOUT_MS="$DESIRED_IDLE_TIMEOUT_MS"
+TIMEOUT_TRANSITION=0
+if [ "$SETTINGS_META" != /dev/null ]; then
+  SAVED_IDLE_SECONDS="$(ab_meta_value "$META" idle_timeout_seconds 2>/dev/null || true)"
+  if grep -Eq '^(lease_token|last_used_at)=' "$META" \
+    || ! SAVED_IDLE_SECONDS="$(ab_normalize_idle_timeout "$SAVED_IDLE_SECONDS" 2>/dev/null)"; then
+    # Legacy owners have no proof of native configuration. Only diagnostics and
+    # daemon-only stop may use this fixed setting before deliberate migration.
+    PRE_TRANSITION_IDLE_TIMEOUT_MS=0
+    TIMEOUT_TRANSITION=1
+  else
+    PRE_TRANSITION_IDLE_TIMEOUT_MS="$((SAVED_IDLE_SECONDS * 1000))"
+    [ "$PRE_TRANSITION_IDLE_TIMEOUT_MS" = "$DESIRED_IDLE_TIMEOUT_MS" ] || TIMEOUT_TRANSITION=1
+  fi
+fi
+export AGENT_BROWSER_IDLE_TIMEOUT_MS="$PRE_TRANSITION_IDLE_TIMEOUT_MS"
 
 if ! ab_session_info "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION" "$DIR/session-info.err"; then
   echo "✗ Could not validate agent-browser session state; no browser connection was attempted." >&2
@@ -255,7 +315,14 @@ SOCKET_DIR="$AB_SESSION_SOCKET_DIR"
 # middle of some other command.
 DAEMON_VERSION="$AB_SESSION_VERSION"
 CLI_VERSION="$(ab_cli_version "$AGENT_BROWSER_BIN" 2>/dev/null || true)"
-if [ "$SESSION_WAS_ACTIVE" = "1" ] && [ -n "$DAEMON_VERSION" ] && [ -n "$CLI_VERSION" ] \
+if [ "$SESSION_WAS_ACTIVE" = 1 ] && [ "$TIMEOUT_TRANSITION" = 1 ]; then
+  if ! ab_stop_daemon "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION"; then
+    echo "✗ Could not stop the daemon for an idle configuration change; existing state was retained." >&2
+    exit 5
+  fi
+  SESSION_WAS_ACTIVE=0
+  ab_log_event "$DIR" timeout-change "previous=$PRE_TRANSITION_IDLE_TIMEOUT_MS desired=$DESIRED_IDLE_TIMEOUT_MS"
+elif [ "$SESSION_WAS_ACTIVE" = "1" ] && [ -n "$DAEMON_VERSION" ] && [ -n "$CLI_VERSION" ] \
   && [ "$DAEMON_VERSION" != "$CLI_VERSION" ]; then
   ab_log_event "$DIR" version-mismatch "daemon=$DAEMON_VERSION cli=$CLI_VERSION action=stopped-stale-daemon"
   cat >&2 <<MSG
@@ -267,10 +334,15 @@ MSG
   # Only the daemon is stopped. The session sidecars (`<session>.target`) are
   # left in place on purpose: they are what lets the replacement daemon rebind to
   # the SAME target instead of opening another tab in the user's window.
-  "$AGENT_BROWSER_BIN" --session "$SESSION" close >/dev/null 2>&1 || true
+  if ! ab_stop_daemon "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION"; then
+    echo "✗ Could not stop the stale daemon; existing session state was retained." >&2
+    exit 5
+  fi
   SESSION_WAS_ACTIVE=0
   STALE_DAEMON_SWAPPED=1
 fi
+
+export AGENT_BROWSER_IDLE_TIMEOUT_MS="$DESIRED_IDLE_TIMEOUT_MS"
 
 AB_BACKUP=""
 META_BACKUP=""
@@ -293,7 +365,15 @@ fi
 
 # --auto-approve: see ab_start_approver in lib.sh. Scoped to this attach.
 start_approver() {
-  [ "$AUTO_APPROVE" -eq 1 ] || return 0
+  [ "$AB_POLICY_AUTO_APPROVE" -eq 1 ] || return 0
+  if [ "$SESSION_WAS_ACTIVE" -eq 1 ]; then
+    # A live reused socket needs no approval. Only cover a redial that lsof
+    # positively identifies; unknown connection state is not permission to click.
+    local connection_state=0
+    ab_is_uint "$AB_SESSION_PID" || return 0
+    ab_pid_has_cdp_connection "$AB_SESSION_PID" "$PORT" || connection_state=$?
+    [ "$connection_state" -eq 1 ] || return 0
+  fi
   ab_start_approver "$DIR" "$SCRIPT_DIR"
 }
 stop_approver() {
@@ -301,37 +381,51 @@ stop_approver() {
 }
 
 COMMITTED=0
+META_PENDING="$DIR/session.meta.pending.$$"
 ATTACH_ESTABLISHED=0
+ATTACH_DAEMON_PID=""
+record_attach_identity() {
+  if ab_session_info "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION" \
+    && [ "$AB_SESSION_ACTIVE" = 1 ] && [ "$AB_SESSION_SOCKET_DIR" = "$SOCKET_DIR" ]; then
+    ATTACH_DAEMON_PID="$AB_SESSION_PID"
+  fi
+}
 TARGET_DISCOVERY_SAFE=0
 OWNED_TARGET_ID=""
 rollback() {
   local status=$?
-  local rollback_list rollback_state rollback_target
+  local rollback_target
   trap - EXIT INT TERM
   stop_approver
-  rm -f "$DIR/attach.err" "$DIR/navigation.err" "$DIR/target.err" "$DIR/rebind.err" "$DIR/ab.tmp.$$" 2>/dev/null || true
+  rm -f "$DIR/attach.err" "$DIR/navigation.err" "$DIR/target.err" "$DIR/rebind.err" "$DIR/ab.tmp.$$" "$META_PENDING" 2>/dev/null || true
 
   if [ "$COMMITTED" -eq 0 ]; then
     if [ "$SESSION_WAS_ACTIVE" -eq 0 ]; then
       if [ "$ATTACH_ESTABLISHED" -eq 1 ] && [ "$TARGET_DISCOVERY_SAFE" -eq 1 ]; then
         rollback_target="$OWNED_TARGET_ID"
-        if [ -z "$rollback_target" ] \
-          && rollback_list="$("$AGENT_BROWSER_BIN" --session "$SESSION" tab list --json 2>/dev/null)" \
-          && ab_tab_state "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "" "$rollback_list"; then
-          rollback_target="$AB_TAB_ACTIVE"
-        fi
         if [ -n "$rollback_target" ] && [ "$rollback_target" = "$PREV_OWNED_TARGET_ID" ]; then
-          # The attach rebound to the tab this session already owned (a re-run
-          # after the daemon died, or a persistent heal). That tab holds the
-          # user's page state; a failed re-attach must not close it.
-          :
-        elif [ -n "$rollback_target" ] && [[ "$rollback_target" =~ ^[A-Za-z0-9_-]+$ ]]; then
-          "$AGENT_BROWSER_BIN" --session "$SESSION" tab close "$rollback_target" >/dev/null 2>&1 || true
+          : # A failed re-attachment must preserve the previously owned page.
+        elif ab_session_info "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION" \
+          && [ "$AB_SESSION_ACTIVE" = 1 ] && [ "$AB_SESSION_SOCKET_DIR" = "$SOCKET_DIR" ] \
+          && ab_is_uint "$ATTACH_DAEMON_PID" && [ "$ATTACH_DAEMON_PID" -gt 0 ] \
+          && [ "$AB_SESSION_PID" = "$ATTACH_DAEMON_PID" ] \
+          && ab_pid_has_cdp_connection "$AB_SESSION_PID" "$PORT"; then
+          ab_admin_existing "$NODE_BIN" "$SCRIPT_DIR/admin.mjs" "$SESSION" "$AB_SESSION_SOCKET_DIR" "$AB_SESSION_PID" \
+            discard-new-attach-target "$rollback_target" "$PREV_OWNED_TARGET_ID" >/dev/null \
+            || echo "! Attachment target cleanup is unverified; rollback will still stop the daemon." >&2
         else
-          echo "! Failed attach left no provable target ID; rollback preserved all Chrome targets." >&2
+          echo "! Failed attach continuity is unproven; rollback preserved all Chrome targets." >&2
         fi
       fi
-      "$AGENT_BROWSER_BIN" --session "$SESSION" close >/dev/null 2>&1 || true
+      if ! ab_stop_daemon "$AGENT_BROWSER_BIN" "$NODE_BIN" "$SCRIPT_DIR/json.mjs" "$SESSION"; then
+        # Neither the old policy nor an executable handle may authorize commands
+        # against an uncommitted daemon whose shutdown could not be proven.
+        [ ! -f "$META" ] || mv -f "$META" "$DIR/session.meta.unverified.$$"
+        rm -f "$AB"
+        echo "✗ Replacement shutdown is unverified; wrapper disabled and recovery artifacts retained in $DIR." >&2
+        release_owner_lock
+        exit 5
+      fi
       # With a previously owned tab, the `<session>.target` sidecar is what lets
       # the next attempt rebind that same tab instead of opening another one;
       # keep it, as the version-swap path does.
@@ -388,13 +482,12 @@ done
   printf 'socket_dir=%s\n' "$SOCKET_DIR"
   printf 'owned_target_id=\n'
   printf 'created_at=%s\n' "$CREATED_AT"
-  # Read by dispatch.sh: persistent=1 lets the wrapper re-run this script by
-  # itself on a recoverable failure, and react=1 makes that re-run pass --react.
-  printf 'persistent=%s\n' "$PERSISTENT"
-  printf 'react=%s\n' "$REACT_HOOK"
-  printf 'auto_approve=%s\n' "$AUTO_APPROVE"
-} > "$META"
-chmod 600 "$META"
+  printf 'persistent=%s\n' "$AB_POLICY_PERSISTENT"
+  printf 'react=%s\n' "$AB_POLICY_REACT"
+  printf 'auto_approve=%s\n' "$AB_POLICY_AUTO_APPROVE"
+  printf 'idle_timeout_seconds=%s\n' "$AB_POLICY_IDLE_TIMEOUT_SECONDS"
+} > "$META_PENDING"
+chmod 600 "$META_PENDING"
 
 if [ "$SESSION_WAS_ACTIVE" -eq 0 ]; then
   echo "• Chrome may show one connection approval. Approve that single prompt; this script will not open retry connections." >&2
@@ -415,8 +508,7 @@ elif [ "${STALE_DAEMON_SWAPPED:-0}" -eq 1 ] \
   && sleep 2 \
   && BOUND="$(browser_command get url 2>"$DIR/attach.err")"; then
   # One extra attempt exists ONLY here. Everywhere else the script attaches once
-  # and does not insist (a repeated dialog is a sign that another process is
-  # reconnecting). But on this path we are the ones who stopped a daemon that was
+  # and does not insist (blind retries can stack approval dialogs). On this path we are the ones who stopped a daemon that was
   # working, and a freshly started daemon's first command often times out;
   # failing here would leave the user with no session at all.
   ATTACH_ESTABLISHED=1
@@ -428,6 +520,7 @@ else
     ATTACH_ESTABLISHED=1
     if browser_command tab new "$TARGET" >/dev/null 2>"$DIR/attach.err"; then
       TARGET_DISCOVERY_SAFE=1
+      record_attach_identity
       ab_log_event "$DIR" tab-new "reason=tab_gone url=$TARGET (Chrome opens new targets in the foreground)"
     fi
     if [ "$TARGET_DISCOVERY_SAFE" -eq 1 ] \
@@ -480,6 +573,7 @@ fi
 stop_approver
 rm -f "$DIR/attach.err"
 
+record_attach_identity
 BOUND="${BOUND//$'\r'/}"
 if [ -z "$BOUND" ]; then
   echo "✗ agent-browser reported success but returned no bound-tab URL." >&2
@@ -573,7 +667,7 @@ if [ -z "$OWNED_TARGET_ID" ] || [[ ! "$OWNED_TARGET_ID" =~ ^[A-Za-z0-9_-]+$ ]]; 
   echo "✗ Connected, but agent-browser reported no active target to own." >&2
   exit 5
 fi
-if ! ab_set_meta_value "$META" owned_target_id "$OWNED_TARGET_ID"; then
+if ! ab_set_meta_value "$META_PENDING" owned_target_id "$OWNED_TARGET_ID"; then
   echo "✗ Connected, but could not persist the owned target safely." >&2
   exit 5
 fi
@@ -586,7 +680,7 @@ if [ "${ATTACH_LOG_PENDING:-0}" -eq 1 ]; then
 fi
 
 REACT_STATUS=""
-if [ "$REACT_HOOK" -eq 1 ]; then
+if [ "$AB_POLICY_REACT" -eq 1 ]; then
   # This is a capability check, not a presence check: `typeof
   # window.__REACT_DEVTOOLS_GLOBAL_HOOK__` is "object" on any page that already
   # has react-scan or the React DevTools extension, so only agent-browser's own
@@ -606,6 +700,11 @@ if [ "$REACT_HOOK" -eq 1 ]; then
   fi
 fi
 
+if ! mv -f "$META_PENDING" "$META"; then
+  echo "✗ Connected, but could not publish the owner policy safely." >&2
+  exit 5
+fi
+
 COMMITTED=1
 trap - EXIT INT TERM
 rm -f "$AB_BACKUP" "$META_BACKUP" 2>/dev/null || true
@@ -615,9 +714,10 @@ cat <<INFO
 ✓ Connected to the user's Chrome on CDP $PORT through one exact WebSocket endpoint
 ✓ Session:  $SESSION
 ✓ Own tab:  $BOUND
+✓ Policy:   persistent=$AB_POLICY_PERSISTENT auto-approve=$AB_POLICY_AUTO_APPROVE react=$AB_POLICY_REACT
 INFO
 
-if [ "$REACT_HOOK" -eq 1 ]; then
+if [ "$AB_POLICY_REACT" -eq 1 ]; then
   case "$REACT_STATUS" in
     ok)
       cat <<INFO
@@ -648,7 +748,7 @@ INFO
   esac
 fi
 
-if [ "$PERSISTENT" -eq 1 ]; then
+if [ "$AB_POLICY_PERSISTENT" -eq 1 ]; then
   cat <<INFO
 ✓ Mode:     persistent. When the daemon dies, the owned tab closes, Chrome restarts
             or agent-browser is upgraded, the wrapper re-runs this connect by itself
@@ -665,7 +765,13 @@ Invoke it with 'bash' so the harness permission rule for bash covers it:
   bash $AB open <url>
   bash $AB screenshot /tmp/shot.png
 
-When the task is done, detach safely and preserve the tab:
+After this task, clear routes and keep the approved connection for follow-ups:
+  bash "$SCRIPT_DIR/cleanup.sh" --keep-alive $SESSION
+
+Reuse this wrapper in the same conversation; do not ask for browser access again.
+Idle parking: ${AB_POLICY_IDLE_TIMEOUT_SECONDS}s (0 disables it); commands renew it, parking retains policy.
+
+When the user asks to disconnect or the conversation ends, release and preserve the tab:
   bash "$SCRIPT_DIR/cleanup.sh" $SESSION
 
 Close the owned tab only when the user explicitly requests it:

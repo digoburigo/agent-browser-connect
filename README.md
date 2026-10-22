@@ -60,14 +60,22 @@ bash ~/.claude/skills/agent-browser-connect/scripts/connect.sh myapp --url http:
 bash <wrapper> snapshot -i
 bash <wrapper> click @e3
 
-# 3. Release the session (keeps the tab, clears network routes, stops the daemon).
-#    connect.sh prints this line with the path already filled in.
+# 3. Finish this task, keeping the approved connection for conversation follow-ups.
+bash <skill-dir>/scripts/cleanup.sh --keep-alive <session>
+
+# 4. Release only on explicit disconnect or at conversation end (keeps the tab).
 bash <skill-dir>/scripts/cleanup.sh <session>
 ```
 
 Add `--react` to `connect.sh` when the task needs React introspection — the DevTools hook is an init script registered once per session, not per page, so it cannot be added later.
 
-Add `--persistent` to have the wrapper heal a dead daemon, a closed tab, a Chrome restart or an upgrade by itself (at most once per command, with a cooldown and a timeout). Add `--auto-approve` on macOS to have it press Chrome's "Allow remote debugging?" button for the skill's own connections. That needs the Accessibility permission for your terminal, and it trades a security prompt for convenience, so it is opt-in. See [`references/design.md`](references/design.md#auto-approve-pressing-chromes-dialog).
+Browser access is conversation-scoped: use the same wrapper for follow-ups. Re-running connect with the same owner/slot reuses the connection and preserves settings. Omitted flags no longer reset them; use `--no-persistent`, `--no-auto-approve` or `--no-react` to opt out explicitly.
+
+Add `--persistent` for bounded recovery after connection loss. Add `--auto-approve` on macOS only after an explicit opt-in to pressing Chrome's security dialog (terminal Accessibility permission required). Reusing a live connection starts no approval clicker. Browser-access permission alone never enables auto-approval. See [`references/design.md`](references/design.md#auto-approve-pressing-chromes-dialog).
+
+Agent-browser's native timer stops idle daemons after one hour. Chrome, the owned tab, wrapper, binding and settings remain for resume. `--idle-timeout <seconds>` changes the inherited owner policy; `0` disables idle shutdown. `AB_IDLE_TIMEOUT_SECONDS` defaults new owners. The derived native timeout overrides ambient native settings on every invocation. Changing a live timeout deliberately replaces the daemon; unchanged settings keep the socket. Idle resume needs a new Chrome connection but remembers a granted auto-approval opt-in. Explicit release removes that policy too. Old watcher-managed owners require one explicit connect to migrate.
+
+Cleanup uses fixed existing-only daemon control, not a separate CLI browser command. It never bootstraps a daemon or replays an uncertain action. Native route and tab operations can still redial Chrome if backend health changes after preflight. The bridge depends on the native protocol tested with 0.39.1, with a 30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported responses fail closed. See [cleanup limits](references/design.md#cleanup).
 
 Full agent-facing instructions: [`SKILL.md`](SKILL.md).
 
@@ -80,7 +88,7 @@ Full agent-facing instructions: [`SKILL.md`](SKILL.md).
 ## Tests
 
 ```bash
-bash tests/run.sh                                  # deterministic, mock agent-browser, node only (~40 s)
+bash tests/run.sh                                  # deterministic mock daemon + lifecycle regressions
 AB_RUN_REAL_CHROME=1 bash tests/real-chrome.sh     # gated; disposable Chrome profile
 AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh    # gated; one tab in YOUR Chrome, gentle
 AB_RUN_USER_CHROME=1 bash tests/stress-user-chrome.sh   # gated; opens N tabs in YOUR Chrome
@@ -90,7 +98,7 @@ AB_RUN_USER_CHROME=1 bash tests/stress-user-chrome.sh   # gated; opens N tabs in
 
 **The stress test can crash the browser it is testing.** At its default 10 tabs x 6 rounds it segfaulted Chrome 153 during round 6 (2026-09-18), taking every open tab with it. Chrome relaunched itself and the helper released all ten sessions cleanly, but do not point this at a browser you are relying on — pass a smaller count (`... stress-user-chrome.sh 3 3`) or run it against a Chrome you are happy to lose.
 
-`tests/run.sh` runs in CI on every push.
+`tests/run.sh` runs in CI on every push. Its lifecycle regressions cover sticky settings, concurrent opt-outs and timeout handoffs, task cleanup, scoped approval, native timeout propagation, migration and transactional replacement. The disposable suite observes daemon process exit, stable follow-up TCP sockets, long commands, same-target resume, zero disable, maximum conversion, failed replacements, malformed-policy release and pre-administration expiry. It inspects actual CDP targets. It does not exercise real approval dialogs or establish compatibility with historical daemon protocols. Set `AB_LEGACY_IDLE_SOURCE` to an archived pre-migration `scripts/idle.mjs` to also observe an already-running old watcher exit after migration.
 
 ## Contributing
 
@@ -100,4 +108,4 @@ If you installed via symlink, edit through the symlink freely; **replacing a sym
 
 ## License
 
-MIT — see [LICENSE](LICENSE). `agent-browser` itself is a separate project (vercel-labs, Apache-2.0); this skill only calls its CLI.
+MIT — see [LICENSE](LICENSE). `agent-browser` itself is a separate project (vercel-labs, Apache-2.0); this skill uses its CLI and fixed native administrative protocol.

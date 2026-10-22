@@ -69,7 +69,7 @@ probe 0 console
 probe 0 frame main
 probe 0 dialog status
 probe 0 network requests
-probe 0 batch 'get url' 'get title'
+probe 0 batch <<< '[["get","url"],["get","title"]]'
 
 echo
 echo "--- target creation / ownership (2) ---"
@@ -116,10 +116,11 @@ probe 2 upload '#f' /etc/passwd
 
 echo
 echo "--- batch cannot smuggle (2) ---"
-probe 2 batch 'get url' 'tab new http://127.0.0.1:1/forbidden'
-probe 2 batch 'get url' 'record start /tmp/should-not-exist.webm'
-probe 2 batch "t'ab' new http://127.0.0.1:1/forbidden"
-probe 2 batch '' 'get url'
+probe 2 batch <<< '[["get","url"],["tab","new","http://127.0.0.1:1/forbidden"]]'
+probe 2 batch <<< '[["get","url"],["record","start","/tmp/should-not-exist.webm"]]'
+probe 2 batch <<< '[["batch"]]'
+probe 2 batch <<< '[[]]'
+probe 2 batch 'get url'
 
 echo
 echo "--- fail-closed, not forbidden (10) ---"
@@ -128,28 +129,20 @@ probe 10 snapshot --brand-new-flag
 probe 10 react eval 'window.x'
 
 echo
-echo "--- C4: argument-mode batch now sends the guarded words as JSON on stdin ---"
-# The change that most needs a real daemon: the mock accepted this because I
-# wrote the mock. Real agent-browser has to accept `batch` with no command
-# arguments and a JSON array on stdin, and produce the same results.
+echo "--- JSON stdin batch results ---"
 set +e
-B1="$(bash "$AB" batch 'get url' 'get title' 2>&1)"; B1S=$?
-B2="$(bash "$AB" batch --bail 'get url' 'get title' 2>&1)"; B2S=$?
-B3="$(bash "$AB" batch 'get url' 2>&1)"; B3S=$?
+B1="$(printf '%s\n' '[["get","url"],["get","title"]]' | bash "$AB" batch 2>&1)"; B1S=$?
+B2="$(printf '%s\n' '[["get","url"],["get","title"]]' | bash "$AB" batch --bail --json 2>&1)"; B2S=$?
+B3="$(printf '%s\n' '[["get","url"]]' | bash "$AB" batch 2>&1)"; B3S=$?
 set -e
-[ "$B1S" = 0 ] && ok 0 "batch 'get url' 'get title'" || { bad "multi-command batch exited $B1S"; printf '     %s\n' "$(printf '%s' "$B1" | head -3)" >&2; }
-[ "$B2S" = 0 ] && ok 0 "batch --bail 'get url' 'get title'" || { bad "--bail batch exited $B2S"; printf '     %s\n' "$(printf '%s' "$B2" | head -3)" >&2; }
-[ "$B3S" = 0 ] && ok 0 "batch 'get url' (single)" || { bad "single-command batch exited $B3S"; printf '     %s\n' "$(printf '%s' "$B3" | head -3)" >&2; }
+[ "$B1S" = 0 ] && ok 0 "multi-command JSON batch" || bad "multi-command batch exited $B1S"
+[ "$B2S" = 0 ] && ok 0 "JSON batch with --bail --json" || bad "--bail batch exited $B2S"
+[ "$B3S" = 0 ] && ok 0 "single-command JSON batch" || bad "single-command batch exited $B3S"
 if printf '%s' "$B1" | grep -q 'about:blank'; then
-  ok 0 "batch results actually came back (about:blank present)"
+  ok 0 "batch results actually came back"
 else
-  bad "batch ran but returned no recognisable result: $(printf '%s' "$B1" | head -c 200)"
+  bad "batch returned no recognisable result"
 fi
-# stdin JSON mode must still work unchanged.
-set +e
-B4="$(printf '[["get","url"],["get","title"]]' | bash "$AB" batch 2>&1)"; B4S=$?
-set -e
-[ "$B4S" = 0 ] && ok 0 "batch via JSON stdin (unchanged path)" || bad "stdin batch exited $B4S: $(printf '%s' "$B4" | head -c 200)"
 
 echo
 echo "--- C3: ab_load_meta rejects a tampered record through the wrapper ---"
