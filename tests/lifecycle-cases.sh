@@ -117,6 +117,42 @@ assert_socket_action close absent
 pass "expiry after preflight never bootstraps and later inactivity reconciles without replay"
 # End IV-C focused caller regressions.
 
+# New owners get the shorter policy; saved and legacy owners retain theirs.
+new_case default-idle-timeout
+printf '%s\n/devtools/browser/default-idle\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+AB_IDLE_TIMEOUT_SECONDS= AGENT_BROWSER_IDLE_TIMEOUT_MS=17 run_connect success "Default idle" >/dev/null 2>&1
+META="$CASE_ROOT/$DEFAULT_SESSION/session.meta"
+AB="$CASE_ROOT/$DEFAULT_SESSION/ab"
+assert_file_contains "$META" idle_timeout_seconds=1200
+assert_native_timeout 1200000
+: > "$CASE_LOG"
+: > "$CASE_LOG.events"
+: > "$CASE_LOG.timeouts"
+AB_IDLE_TIMEOUT_SECONDS=9 run_connect success "Inherited default" >/dev/null 2>&1
+AGENT_BROWSER_IDLE_TIMEOUT_MS=19 run_wrapper success "$AB" get url >/dev/null
+assert_file_contains "$META" idle_timeout_seconds=1200
+assert_native_timeout 1200000
+assert_socket_action close absent
+assert_socket_action tab_close absent
+run_cleanup 1 "$DEFAULT_SESSION" >/dev/null
+assert_socket_action close 1
+assert_socket_action tab_close absent
+pass "new owners use 20-minute native idle policy and daemon-only release preserves tabs"
+
+new_case saved-hour-timeout
+printf '%s\n/devtools/browser/saved-hour\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
+run_connect success "Existing hour policy" --idle-timeout 3600 >/dev/null 2>&1
+META="$CASE_ROOT/$DEFAULT_SESSION/session.meta"
+: > "$CASE_LOG"
+: > "$CASE_LOG.events"
+: > "$CASE_LOG.timeouts"
+AB_IDLE_TIMEOUT_SECONDS=1200 run_connect success "Preserve saved hour" >/dev/null 2>&1
+assert_file_contains "$META" idle_timeout_seconds=3600
+assert_native_timeout 3600000
+assert_socket_action close absent
+assert_socket_action tab_close absent
+pass "the new default does not replace an existing saved one-hour policy"
+
 new_case native-timeout
 printf '%s\n/devtools/browser/native\n' "$PORT" > "$CASE_CHROME/DevToolsActivePort"
 AGENT_BROWSER_IDLE_TIMEOUT_MS=17 run_connect success "Native owner" --idle-timeout 4 >/dev/null 2>&1

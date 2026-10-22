@@ -156,7 +156,7 @@ ab_configure_policy() {
   # Legacy owners must resolve identically across processes with different env.
   if [ -z "$idle" ]; then
     if [ "$file" = /dev/null ]; then
-      idle="${AB_IDLE_TIMEOUT_SECONDS:-3600}"
+      idle="${AB_IDLE_TIMEOUT_SECONDS:-1200}"
     else
       idle=3600
     fi

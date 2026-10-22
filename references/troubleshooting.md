@@ -153,6 +153,13 @@ sockets and targets, not real approval dialogs.
 
 ## Stale daemons
 
+New owners default to an explicit 1200-second (20-minute) native timeout; existing saved
+timeouts remain unchanged. To opt an existing owner into 20 minutes, reconnect for the
+same owner/slot with `--idle-timeout 1200`. This replaces a live daemon and may require
+one new Chrome approval. Tabs remain open after idle disconnection. Closing an owned
+tab does not itself stop the daemon. Diagnostics count as activity, so repeated polling
+can keep it alive.
+
 Attached browsers are exempt from agent-browser's default one-hour idle timeout, not an
 explicit native timeout. The skill derives `AGENT_BROWSER_IDLE_TIMEOUT_MS` from saved
 owner policy on each invocation. Native shutdown preserves Chrome, owner policy and the

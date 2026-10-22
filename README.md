@@ -6,7 +6,7 @@ It wraps [`agent-browser`](https://github.com/vercel-labs/agent-browser) so that
 
 ## Why
 
-`agent-browser` can attach to a running Chrome over CDP, but `--pin-tab` is not sticky: a single command issued without the connection flags rebinds the session to whatever tab is in front. This skill generates a per-session wrapper that passes the exact browser WebSocket, `--pin-tab` and `--session` on **every** call, plus a guard that rejects the flags known to trigger extra Chrome approval dialogs or open a second browser window.
+Agent-browser 0.39.2 retains a live external CDP attachment across follow-up commands, and tab pinning is sticky. This skill adds conversation ownership, exact-target verification, serialized commands, controlled recovery and an allow-list. Its per-session wrapper still passes the exact browser WebSocket, `--pin-tab` and `--session` on every call; upstream attachment persistence is not an ownership or cleanup boundary.
 
 ## Prerequisites
 
@@ -73,7 +73,7 @@ Browser access is conversation-scoped: use the same wrapper for follow-ups. Re-r
 
 Add `--persistent` for bounded recovery after connection loss. Add `--auto-approve` on macOS only after an explicit opt-in to pressing Chrome's security dialog (terminal Accessibility permission required). Reusing a live connection starts no approval clicker. Browser-access permission alone never enables auto-approval. See [`references/design.md`](references/design.md#auto-approve-pressing-chromes-dialog).
 
-Agent-browser's native timer stops idle daemons after one hour. Chrome, the owned tab, wrapper, binding and settings remain for resume. `--idle-timeout <seconds>` changes the inherited owner policy; `0` disables idle shutdown. `AB_IDLE_TIMEOUT_SECONDS` defaults new owners. The derived native timeout overrides ambient native settings on every invocation. Changing a live timeout deliberately replaces the daemon; unchanged settings keep the socket. Idle resume needs a new Chrome connection but remembers a granted auto-approval opt-in. Explicit release removes that policy too. Old watcher-managed owners require one explicit connect to migrate.
+New owners default to **20-minute idle disconnection**, using agent-browser's native timer. Chrome, the owned tab, wrapper, binding and settings remain for resume. Existing saved timeouts are unchanged; reconnect with `--idle-timeout 1200` to switch an existing owner. Changing a live timeout replaces the daemon and may require approval; unchanged settings keep the socket. `--idle-timeout 0` disables shutdown. Idle resume needs a new Chrome connection but remembers a granted auto-approval opt-in. See [session options](references/session-options.md#idle-policy) for environment overrides and legacy migration.
 
 Cleanup uses fixed existing-only daemon control, not a separate CLI browser command. It never bootstraps a daemon or replays an uncertain action. Native route and tab operations can still redial Chrome if backend health changes after preflight. The bridge depends on the native protocol tested with 0.39.1, with a 30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported responses fail closed. See [cleanup limits](references/design.md#cleanup).
 
@@ -82,6 +82,7 @@ Full agent-facing instructions: [`SKILL.md`](SKILL.md).
 ## Documentation
 
 - [`SKILL.md`](SKILL.md) — the steps the agent follows. Short by design.
+- [`references/session-options.md`](references/session-options.md) — optional recovery, auto-approval, React, idle policy and batch commands.
 - [`references/design.md`](references/design.md) — why the wrapper exists, what the guard rejects, the containment boundary, and the Chrome/CDP behaviour behind each decision.
 - [`references/troubleshooting.md`](references/troubleshooting.md) — recovery for repeated approval dialogs, a closed port, Chrome restarts, `tab_gone`, drift, wrong-page commands, stale daemons, and the exit-status table.
 

@@ -9,10 +9,12 @@ The user watches browser work in their own window: their profile, logins, extens
 and session state. A headless browser cannot see what they are logged into and they
 cannot see what it does. So the only target is their running Chrome over CDP.
 
-`--pin-tab` in agent-browser is not sticky in practice: one command without the
-connection flags rebinds the session to another tab. The wrapper therefore passes the
-exact browser WebSocket, `--pin-tab` and `--session` on every call, and it is the only
-supported way to issue browser commands.
+Agent-browser 0.39.2 keeps a live external attachment when follow-up commands omit
+connection flags (upstream #2155), and native tab pinning is sticky. Earlier versions
+could drop the attachment and launch a local browser. The wrapper still passes the
+exact browser WebSocket, `--pin-tab` and `--session` on every call: native persistence
+is not conversation ownership, an allow-list or a cleanup boundary. It remains the
+only supported way to issue browser commands.
 
 ## Exact WebSocket, one attach
 
@@ -43,7 +45,8 @@ The lifecycle now separates three operations:
   connection, retaining the daemon, wrapper, target and policy.
   It fails without disconnecting if route removal fails or would require reconnecting.
   The agent stops its own traces/profilers before this step.
-- **Native idle shutdown** stops only this session's daemon after one hour without commands.
+- **Native idle shutdown** stops only this session's daemon after the saved idle interval
+  (20 minutes for new owners by default).
   It preserves the tab sidecar and owner metadata, including explicit auto-approval
   policy, so a resume can rebind the same tab without renegotiating the user's opt-in.
   Chrome still needs a new transport approval after idle shutdown unless auto-approval
@@ -61,9 +64,9 @@ inferred from an existing tab or another owner. `--no-react` affects future atta
 an installed init script cannot be uninstalled from a live daemon by changing metadata.
 
 `--idle-timeout` is inherited. `AB_IDLE_TIMEOUT_SECONDS` defaults a new session to
-3600 seconds. An existing owner missing the timeout uses a fixed 3600 seconds regardless
-of the current environment. Zero disables native idle shutdown. `ab_configure_policy`
-derives and exports `AGENT_BROWSER_IDLE_TIMEOUT_MS` from normalized saved or requested
+1200 seconds (20 minutes). Existing saved timeouts are unchanged. An existing owner
+missing the timeout uses a fixed legacy 3600 seconds regardless of the current environment.
+Zero disables native idle shutdown. `ab_configure_policy` derives and exports `AGENT_BROWSER_IDLE_TIMEOUT_MS` from normalized saved or requested
 seconds for every CLI invocation. Ambient native timeout values cannot override owner
 policy. Milliseconds are never persisted. The maximum accepted seconds value is
 2147483647, which converts to 2147483647000 milliseconds.
@@ -73,7 +76,10 @@ not from an explicitly configured timeout. A running command can outlast the con
 idle interval. Native expiration is independent of the shell lock, so transport can
 disconnect between preflight and forwarding. The dispatcher never replays a sent action.
 The disposable regression delays a mutation beyond expiry, then verifies one mutation,
-the same owned target and no additional tabs.
+the same owned target and no additional tabs. Daemon diagnostics and dashboard input
+also refresh native activity; polling can postpone shutdown. Closing an owned tab enters
+`tab_gone` without stopping the daemon. There is no tab-close watcher or automatic tab
+closure: native idle shutdown disconnects from external Chrome and preserves its tabs.
 
 Changing a live timeout is a connect transaction. Connect validates desired policy first,
 then inspects and stops the old daemon using its saved native configuration. It requires
@@ -111,6 +117,8 @@ the session held by the old one, and the first BROWSER command prints
 has no external CDP attachment, so without the connection flags it launches its own
 Chrome: measured 2026-09-16 going 0.37.1 → 0.38.0, a bare `tab list` on a leftover
 session started a full Chrome for Testing tree instead of using the user's browser.
+The 0.39.2 attachment-persistence fix stores its target in daemon memory, so it does not
+replace this deliberate restart-and-reattach safeguard.
 
 `session info` is the one call that does **not** restart it, and it reports the daemon's
 version, so both scripts compare that against the CLI on `PATH` (`ab_cli_version`) right
