@@ -109,6 +109,14 @@ timeout replacement and version swaps use `ab_stop_daemon` to poll non-connectin
 reply alone is not success. Unproven-metadata release uses a fixed zero timeout only for
 non-connecting diagnostics and daemon stop. It performs no browser commands.
 
+Since 0.39.4 (upstream #2135) an explicit `close` also releases the session's tab pin
+before replying and rewrites the `<session>.target` sidecar with `"pinned": false`.
+Every path through `ab_stop_daemon` (timeout replacement, version swap, release) therefore
+leaves the sidecar unpinned. The binding the skill relies on is the sidecar's target id and
+URL, which survive. The pin comes back with the next attach, because the wrapper passes
+`--pin-tab` on every call. A failed replacement restores metadata and the wrapper, not that
+flag; a pin left by a dead daemon does not lock the tab anyway.
+
 ## Version mismatch after an upgrade
 
 The daemon keeps running the agent-browser it was started with. Upgrading the CLI leaves
@@ -429,7 +437,7 @@ after verified shutdown. Unknown shutdown retains recovery artifacts with status
 If native expiry wins after keep-alive preflight, cleanup refuses rather than silently
 releasing; plain release can reconcile explicitly reported inactivity.
 
-The bridge depends on the native protocol tested with agent-browser 0.39.1. It uses a
+The bridge depends on the native protocol tested with agent-browser 0.39.4. It uses a
 30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported frames,
 responses or confirmation requests fail closed. No historical protocol compatibility
 is promised. Diagnostics require an explicit boolean `active`; a missing or malformed

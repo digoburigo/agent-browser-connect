@@ -11,7 +11,7 @@ Agent-browser 0.39.2 retains a live external CDP attachment across follow-up com
 ## Prerequisites
 
 - **bash**, **node** (for the small JSON helpers), and standard Unix tools
-- **`agent-browser`** on your `PATH`: `npm install -g agent-browser` (tested against 0.39.1)
+- **`agent-browser`** on your `PATH`: `npm install -g agent-browser` (tested against 0.39.4)
 - **Google Chrome** (or Chromium / Brave / Chrome Canary) with remote debugging on: open `chrome://inspect/#remote-debugging`, tick **Enable**, wait for `Server running at: 127.0.0.1:9222`. Chrome remembers this across restarts.
 
 macOS and Linux. Windows is not supported (WSL should work; untested).
@@ -75,7 +75,7 @@ Add `--persistent` for bounded recovery after connection loss. Add `--auto-appro
 
 New owners default to **20-minute idle disconnection**, using agent-browser's native timer. Chrome, the owned tab, wrapper, binding and settings remain for resume. Existing saved timeouts are unchanged; reconnect with `--idle-timeout 1200` to switch an existing owner. Changing a live timeout replaces the daemon and may require approval; unchanged settings keep the socket. `--idle-timeout 0` disables shutdown. Idle resume needs a new Chrome connection but remembers a granted auto-approval opt-in. See [session options](references/session-options.md#idle-policy) for environment overrides and legacy migration.
 
-Cleanup uses fixed existing-only daemon control, not a separate CLI browser command. It never bootstraps a daemon or replays an uncertain action. Native route and tab operations can still redial Chrome if backend health changes after preflight. The bridge depends on the native protocol tested with 0.39.1, with a 30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported responses fail closed. See [cleanup limits](references/design.md#cleanup).
+Cleanup uses fixed existing-only daemon control, not a separate CLI browser command. It never bootstraps a daemon or replays an uncertain action. Native route and tab operations can still redial Chrome if backend health changes after preflight. The bridge depends on the native protocol tested with 0.39.4, with a 30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported responses fail closed. See [cleanup limits](references/design.md#cleanup).
 
 Full agent-facing instructions: [`SKILL.md`](SKILL.md).
 

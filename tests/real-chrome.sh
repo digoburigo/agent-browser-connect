@@ -180,6 +180,12 @@ page_exists() {
   node -e 'const id=process.argv[1];let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.exit(JSON.parse(s).pages.some(p=>p.targetId===id)?0:1))' "$target_id"
 }
 
+# The binding a <session>.target sidecar records: target id and URL. Its `pinned`
+# flag is agent-browser's own state, and since 0.39.4 an explicit close clears it.
+sidecar_binding() {
+  node -e 'const t=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(t.targetId);console.log(t.url)' "$1"
+}
+
 assert_blocked_without_growth() {
   local wrapper="$1"
   shift
@@ -427,7 +433,8 @@ for ORIGINAL_ACTIVITY in live inactive; do
   assert_eq "$REPLACEMENT_STATUS" 5
   cmp "$META" "$TEMP_ROOT/rollback.meta" || fail "failed replacement changed policy"
   cmp "$AB" "$TEMP_ROOT/rollback.ab" || fail "failed replacement changed wrapper"
-  cmp "$SOCKET_DIR/$SESSION.target" "$TEMP_ROOT/rollback.target" || fail "failed replacement changed binding"
+  [ "$(sidecar_binding "$SOCKET_DIR/$SESSION.target")" = "$(sidecar_binding "$TEMP_ROOT/rollback.target")" ] \
+    || fail "failed replacement changed binding"
   FAILED_PID="$(< "$AB_TEST_FAILED_PID")"
   ab_is_uint "$FAILED_PID" || fail "adapter did not capture replacement PID"
   process_live "$FAILED_PID" && fail "failed replacement daemon survived rollback"

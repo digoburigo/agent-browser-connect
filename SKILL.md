@@ -63,6 +63,8 @@ On refusal, follow the emitted instruction:
 - **Exit 8:** recover with connect for the same owner/slot.
 - **Exit 9 or `outcome_unknown`:** the action may have run. Inspect with a fresh
   snapshot or `get url` before repeating a mutation; recovery must not replay it.
+- **`page_wedged`:** the page hangs. Do not close or switch tabs as the message says;
+  `bash <wrapper> open <url>` recovers the same tab.
 
 Each owner uses its own session. Fresh attachment, closed-tab replacement and drift
 restoration can move Chrome's foreground tab. Reuse connections and inspect screenshots
