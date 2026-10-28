@@ -107,9 +107,9 @@ BATCH_STDIN=""
 if [ "${1:-}" = "batch" ]; then
   for argument in "${@:2}"; do
     case "$argument" in
-      --bail|--json) ;;
+      --bail|--json|--omit-command) ;;
       *)
-        echo "✗ Batch operands are no longer accepted. Send JSON string arrays on stdin; only --bail and --json are batch flags." >&2
+        echo "✗ Batch operands are no longer accepted. Send JSON string arrays on stdin; only --bail, --json and --omit-command are batch flags." >&2
         exit 2
         ;;
     esac

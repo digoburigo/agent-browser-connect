@@ -53,9 +53,7 @@ bash <wrapper> click @e3
 ```
 
 Open, snapshot, act on `@eN` refs, then re-snapshot after navigation.
-Every browser command uses the wrapper, even though agent-browser 0.39.2 retains a live
-CDP attachment without repeated connection flags. Attachment persistence does not replace
-ownership checks, command restrictions or controlled recovery.
+Every browser command goes through the wrapper, never bare `agent-browser`.
 
 On refusal, follow the emitted instruction:
 - **Exit 2:** deliberately forbidden; use the named alternative.

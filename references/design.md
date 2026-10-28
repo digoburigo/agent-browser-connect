@@ -9,7 +9,7 @@ The user watches browser work in their own window: their profile, logins, extens
 and session state. A headless browser cannot see what they are logged into and they
 cannot see what it does. So the only target is their running Chrome over CDP.
 
-Agent-browser 0.39.2 keeps a live external attachment when follow-up commands omit
+Since 0.39.2, agent-browser keeps a live external attachment when follow-up commands omit
 connection flags (upstream #2155), and native tab pinning is sticky. Earlier versions
 could drop the attachment and launch a local browser. The wrapper still passes the
 exact browser WebSocket, `--pin-tab` and `--session` on every call: native persistence
@@ -28,7 +28,7 @@ stranded (upstream #1739), so the cost is the dialog, not an accumulating pile. 
 matching `DevToolsActivePort` file without opening a WebSocket, and hands agent-browser
 the exact URL. It attaches once and does not retry blindly. Repeated dialogs mean new
 connections: check task cleanup, setting changes and daemon loss before blaming another
-process. `--persistent` adds bounded recovery (see below). Last verified against agent-browser 0.39.1 (2026-10-15): the disposable-profile suite
+process. `--persistent` adds bounded recovery (see below). Measured on agent-browser 0.39.1 (2026-10-15): the disposable-profile suite
 and the user-Chrome guard probe each attached once (`attach=1`, no other foreground events).
 
 ## Conversation lifetime, task cleanup, and native idle shutdown
@@ -393,8 +393,9 @@ printf '%s\n' '[["fill","#name",""],["snapshot","-i"]]' | bash <wrapper> batch -
 
 Migrate quoted command operands to arrays. For example, replace `batch 'get url'`
 with `printf '%s\n' '[["get","url"]]' | bash <wrapper> batch`. Quoted operands now
-fail with a JSON-stdin migration message. Only `--bail` and `--json` are batch flags
-outside the arrays. Ordinary single commands keep their existing interface.
+fail with a JSON-stdin migration message. Only `--bail`, `--json` and `--omit-command`
+(0.40.0+; with `--json` it replaces each echoed command array with its index) are batch
+flags outside the arrays. Ordinary single commands keep their existing interface.
 
 `json.mjs batch-check <bash-path> <guard-path>` reads raw stdin directly. Bash must
 not capture raw input first because command substitution erases literal NUL. The helper
@@ -437,11 +438,11 @@ after verified shutdown. Unknown shutdown retains recovery artifacts with status
 If native expiry wins after keep-alive preflight, cleanup refuses rather than silently
 releasing; plain release can reconcile explicitly reported inactivity.
 
-The bridge depends on the native protocol tested with agent-browser 0.39.4. It uses a
-30-second active-I/O deadline and a 256 KiB aggregate response cap. Unsupported frames,
-responses or confirmation requests fail closed. No historical protocol compatibility
-is promised. Diagnostics require an explicit boolean `active`; a missing or malformed
-field cannot prove inactivity.
+The bridge depends on the native protocol of the agent-browser version the README names
+as tested. It uses a 30-second active-I/O deadline and a 256 KiB aggregate response cap.
+Unsupported frames, responses or confirmation requests fail closed. No historical
+protocol compatibility is promised. Diagnostics require an explicit boolean `active`; a
+missing or malformed field cannot prove inactivity.
 
 Existing-only transport does not make browser actions atomic with CDP preflight.
 Native route and tab handlers can redial their backend if health changes afterward.

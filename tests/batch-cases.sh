@@ -20,6 +20,9 @@ assert_file_not_contains "$CASE_LOG" 'two\\ words'
 BATCH_OUTPUT="$(printf '[]' | run_wrapper success "$AB" batch)"
 assert_eq "$BATCH_OUTPUT" "batched"
 assert_eq "$(cat "$CASE_STATE/batch-stdin")" '[]'
+BATCH_OUTPUT="$(printf '%s' '[["get","url"]]' | run_wrapper success "$AB" batch --json --omit-command)"
+assert_eq "$BATCH_OUTPUT" "batched"
+assert_file_contains "$CASE_LOG" 'batch --json --omit-command'
 pass "batch preserves exact arrays and keeps flags outside stdin"
 
 assert_batch_refused 2 '[["get","url"],["bringtofront"]]' blocked

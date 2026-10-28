@@ -165,13 +165,13 @@ diff screenshot:-b --baseline -o --output -t --threshold -s --selector --full
 console:--clear
 errors:--clear
 profiler start:--categories
-network route:--abort --body --resource-type
+network route:--abort --body --allow-origin --resource-type
 network requests:--clear --filter --type --method --status
 network har start:--content
 cookies set:--url --domain --path --httpOnly --secure --sameSite --expires --curl
 a11y:--tags -s --selector
 react suspense:--only-dynamic
-batch:--bail
+batch:--bail --omit-command
 skills get:--full --all
 '
 

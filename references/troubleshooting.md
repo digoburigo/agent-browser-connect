@@ -137,9 +137,7 @@ AB_RUN_REAL_CHROME=1 AB_REAL_CHROME_HEADLESS=0 bash tests/real-chrome.sh  # visi
 
 Wrappers, `session.meta` and `events.log` live under `~/Library/Caches/agent-browser-connect`
 on macOS and `${XDG_STATE_HOME:-~/.local/state}/agent-browser-connect` elsewhere
-(`AB_CONNECT_ROOT` overrides). Until 2026-09-25 they lived in `$TMPDIR`, which macOS purges;
-a purged root deleted the wrapper an agent was still calling. Sessions connected before that
-date still use their `$TMPDIR` wrapper until they are cleaned up and connected again.
+(`AB_CONNECT_ROOT` overrides).
 
 ## Cleanup transport limits
 
@@ -147,8 +145,8 @@ Cleanup sends fixed requests to the validated existing native socket, not bare C
 browser commands. Omitting `--cdp` alone does not prevent CLI bootstrap or ambient
 launch changes. The bridge never launches a daemon or replays an uncertain action.
 Native route and tab operations can still redial after CDP preflight if backend health
-changes. Protocol support is tested with 0.39.4, not all historical versions. Active
-I/O has a 30-second deadline and a 256 KiB aggregate response cap; unsupported replies
+changes. Protocol support is tested with the version the README names, not all historical
+versions. Active I/O has a 30-second deadline and a 256 KiB aggregate response cap; unsupported replies
 fail closed. Keep recovery artifacts after status 5. Status 6 means shutdown completed
 but optional target closure was not verified. Disposable checks inspect actual PIDs,
 sockets and targets, not real approval dialogs.
@@ -166,9 +164,6 @@ Attached browsers are exempt from agent-browser's default one-hour idle timeout,
 explicit native timeout. The skill derives `AGENT_BROWSER_IDLE_TIMEOUT_MS` from saved
 owner policy on each invocation. Native shutdown preserves Chrome, owner policy and the
 target sidecar. `--idle-timeout 0` explicitly disables it despite ambient native settings.
-Old watcher-managed owners need one explicit connect to migrate. Successful publication
-removes the old watcher's authority; it exits on its next read. Cached old wrappers refuse
-browser commands until migration. There is no idle log or replacement watcher.
 
 Past roughly 20 attached daemons, new sessions have been observed timing out even though
 Chrome remained healthy. Inspect the daemon's process and the owner's saved timeout.

@@ -27,8 +27,7 @@ Live connection reuse starts no approval clicker. Idle shutdown preserves the op
 ## Idle policy
 
 New owners default to 1200 seconds (20 minutes), overridden by `AB_IDLE_TIMEOUT_SECONDS`.
-Existing saved policies are inherited, including the previous 3600-second default.
-Legacy records without a timeout retain a fixed 3600-second migration fallback.
+Existing saved policies are inherited.
 
 To deliberately change an owner's policy, run connect for the same owner/slot with
 `--idle-timeout 1200`. Changing a live timeout replaces the daemon and may require a
@@ -40,9 +39,6 @@ settings and target binding for resume. Long commands can finish before shutdown
 Daemon commands (including diagnostics) and dashboard input count as activity;
 avoid polling solely to keep a connection alive. Closing the owned tab does not itself
 stop the daemon or reopen the tab.
-
-Old watcher-managed wrappers need one explicit connect to migrate before more browser
-commands. See [troubleshooting](troubleshooting.md) for migration and idle-resume failures.
 
 ## React introspection
 
@@ -60,13 +56,15 @@ explain that cost instead of repeatedly reconnecting. Later `--enable` flags are
 Send JSON arrays of command argument arrays on stdin:
 
 ```bash
-printf '%s\n' '[["snapshot","-i"],["click","@e3"]]' | bash <wrapper> batch --bail --json
+printf '%s\n' '[["snapshot","-i"],["click","@e3"]]' | bash <wrapper> batch --bail --json --omit-command
 ```
 
 Each command is a nonempty array of strings. Empty arguments, spaces, tabs and Unicode
-are preserved; `[["fill","#name",""]]` clears an input. Only `--bail` and `--json`
-belong outside the arrays. Quoted command operands are retired. Every member is guarded
-before browser access; NUL, CR, LF and unit separator are rejected inside words.
+are preserved; `[["fill","#name",""]]` clears an input. Only `--bail`, `--json` and
+`--omit-command` belong outside the arrays. `--omit-command` (with `--json`) replaces each
+echoed command array with its index, which keeps output short and stops echoing `fill`
+values; typed text and `get value`/`eval` results can still contain them. Quoted command
+operands are retired. Every member is guarded before browser access; NUL, CR, LF and unit separator are rejected inside words.
 
 For long observation loops, `snapshot --delta` prints changes and
 `screenshot --if-changed <path>` skips identical captures.

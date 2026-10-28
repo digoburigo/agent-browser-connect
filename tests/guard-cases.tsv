@@ -27,6 +27,7 @@
 0	eval	window.location.href
 0	batch
 0	batch	--bail	--json
+0	batch	--json	--omit-command
 0	tab	list
 0	tab	list	--json
 
@@ -63,6 +64,7 @@
 
 ## network, storage, emulation
 0	network	route	http://x/	--abort
+0	network	route	http://api.x/data	--body	{"ok":true}	--allow-origin	http://app.x
 0	network	unroute
 0	network	requests	--filter	api
 0	network	har	start	/tmp/h.har
