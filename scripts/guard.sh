@@ -186,6 +186,21 @@ AB_VERB_MAX_POSITIONAL='
 tab list:0
 '
 
+# Verbs whose native parser reads a negative number as a value, so `-23.5` is a
+# positional here rather than a flag. Listed per verb because the rest are not
+# safe: `scroll down -5` skips any dash word and scrolls the default amount, which
+# would turn a loud refusal into the wrong action. Other dash words stay refused
+# on these verbs too, since the CLI strips `-q` or `--cdp` even from a `fill` value.
+AB_VERB_NEGATIVE_NUMBERS='
+fill
+type
+keyboard type
+keyboard inserttext
+mouse move
+mouse wheel
+set geo
+'
+
 # Key chords that create, restore, close or replace a Chrome target. Scanned
 # across every word of a `press`, not just the first argument: the previous
 # implementation read $2 alone, so `press --human Meta+t` walked straight past it.
@@ -225,7 +240,7 @@ inspect:opens a DevTools window, which is a new target outside the pin.
 connect:would replace this session CDP attachment. connect.sh owns attachment.
 close:would tear down the session from inside a command. Use cleanup.sh.
 chat:drives the browser through a model outside this wrapper guard.
-mcp:exposes the session over a server that does not pass through this guard.
+mcp:the server and `mcp call` both run browser commands that do not pass through this guard. Run the same command through this wrapper instead.
 dashboard:starts a server and a browser surface outside the owned target.
 plugin:installs and runs third-party code from npm or GitHub inside the browser session.
 upgrade:replaces the agent-browser CLI mid-session, which is exactly the version mismatch connect.sh exists to resolve deliberately.
@@ -429,6 +444,9 @@ ab_guard_command() {
   shift "$consumed"
   positional=0
   for word in "$@"; do
+    if ab__guard_in_list "$AB_VERB_NEGATIVE_NUMBERS" "$verb" && [[ "$word" =~ ^-[0-9]+(\.[0-9]+)?$ ]]; then
+      continue
+    fi
     case "$word" in
       -*)
         flag="${word%%=*}"

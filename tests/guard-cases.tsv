@@ -141,6 +141,7 @@
 2	confirm	3
 2	deny	3
 2	mcp
+2	mcp	call	agent_browser_open	{}
 2	chat	do the thing
 2	dashboard	start
 
@@ -163,6 +164,27 @@
 10	react	eval	window.x
 10	snapshot	--brand-new-flag
 10	get	somethingnew
+
+## negative numbers are values only where the native parser reads them as values
+0	set	geo	-23.5	-46.6
+0	mouse	move	-5	10
+0	mouse	wheel	-100
+0	mouse	wheel	-100	-50
+0	fill	@e1	-5
+0	fill	@e1	-5.25
+0	type	@e1	-5
+0	keyboard	type	-5
+0	keyboard	inserttext	-5
+10	scroll	down	-5
+10	get	text	-5
+10	tab	list	-5
+10	fill	@e1	--hello
+10	fill	@e1	-x
+10	fill	@e1	-5x
+10	fill	@e1	-1.2.3
+10	fill	@e1	-.5
+2	fill	@e1	-5	--cdp	ws://x
+2	set	geo	-23.5	-46.6	--session=other
 
 ## nested batch would carry a whole unguarded program
 B2	batch

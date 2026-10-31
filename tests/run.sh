@@ -36,6 +36,7 @@ trap cleanup_suite EXIT INT TERM
 bash "$SKILL_DIR/tests/guard.sh"
 bash "$SKILL_DIR/tests/lib-interfaces.sh"
 node "$SKILL_DIR/tests/batch-check.mjs"
+node "$SKILL_DIR/tests/mcp-catalog.mjs"
 node "$SKILL_DIR/tests/admin.mjs"
 
 fail() {

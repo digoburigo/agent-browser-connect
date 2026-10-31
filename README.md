@@ -11,7 +11,7 @@ Since 0.39.2, agent-browser retains a live external CDP attachment across follow
 ## Prerequisites
 
 - **bash**, **node** (for the small JSON helpers), and standard Unix tools
-- **`agent-browser`** on your `PATH`: `npm install -g agent-browser` (tested against 0.40.0)
+- **`agent-browser`** on your `PATH`: `npm install -g agent-browser` (tested against 0.41.0)
 - **Google Chrome** (or Chromium / Brave / Chrome Canary) with remote debugging on: open `chrome://inspect/#remote-debugging`, tick **Enable**, wait for `Server running at: 127.0.0.1:9222`. Chrome remembers this across restarts.
 
 macOS and Linux. Windows is not supported (WSL should work; untested).
@@ -93,6 +93,7 @@ bash tests/run.sh                                  # deterministic mock daemon +
 AB_RUN_REAL_CHROME=1 bash tests/real-chrome.sh     # gated; disposable Chrome profile
 AB_RUN_USER_CHROME=1 bash tests/real-chrome-guard.sh    # gated; one tab in YOUR Chrome, gentle
 AB_RUN_USER_CHROME=1 bash tests/stress-user-chrome.sh   # gated; opens N tabs in YOUR Chrome
+node tests/mcp-catalog.mjs --live                  # after a version bump; compares the guard's tool catalog with the installed CLI
 ```
 
 `real-chrome-guard.sh` is the safe one: a single session, no concurrency, no tab creation, and it releases with plain `cleanup.sh` so your tab survives. It checks what the mock suite structurally cannot — that the guard really sits in front of a live CLI, that a real daemon accepts the batch form the dispatcher sends, and that the bound tab is unchanged after every refusal.

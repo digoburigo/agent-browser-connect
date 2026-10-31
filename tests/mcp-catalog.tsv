@@ -1,0 +1,163 @@
+# Every tool `agent-browser mcp --tools all` lists, classified against scripts/guard.sh.
+# Checked by tests/mcp-catalog.mjs. Run it with --live after a version bump.
+# Format: <tool without agent_browser_><TAB><own inputs, or -><TAB><guard status><TAB>word<TAB>word...
+#   0 = allowed  ·  2 = deliberately forbidden  ·  10 = not in the allow-list
+# The * row holds the inputs every tool shares; other rows leave them out.
+
+*	allowedDomains,caCert,clearCaCert,extraArgs,idleTimeout,namespace,restore,restoreCheckFn,restoreCheckText,restoreCheckUrl,restoreSave,session,timeoutMs,useSystemCa
+a11y	json,selector,tags,url	0	a11y
+auth_delete	name	2	auth	delete
+auth_list	-	2	auth	list
+auth_login	name,noNavigate	2	auth	login
+auth_save	name,password,passwordSelector,submitSelector,url,username,usernameSelector	2	auth	save
+auth_show	name	2	auth	show
+back	-	0	back
+batch	bail,commands,omitCommand	0	batch
+chat	message,model,quiet,verbose	2	chat
+check	selector	0	check
+click	human,newTab,selector	0	click
+clipboard_copy	-	2	clipboard	copy
+clipboard_paste	-	2	clipboard	paste
+clipboard_read	-	2	clipboard	read
+clipboard_write	text	2	clipboard	write
+close	all	2	close
+confirm	id	2	confirm
+connect	pinTab,target	2	connect
+console	clear	0	console
+cookies_clear	-	0	cookies	clear
+cookies_get	-	0	cookies	get
+cookies_set	domain,expires,httpOnly,name,path,sameSite,secure,url,value	0	cookies	set
+cookies_set_curl	domain,file,url	0	cookies	set	--curl
+dashboard_start	allowedOrigins,port	2	dashboard	start
+dashboard_stop	-	2	dashboard	stop
+dblclick	selector	0	dblclick
+deny	id	2	deny
+device	action	10	device
+dialog_accept	text	0	dialog	accept
+dialog_dismiss	-	0	dialog	dismiss
+dialog_status	-	0	dialog	status
+diff_screenshot	baseline,fullPage,output,selector,threshold	0	diff	screenshot
+diff_snapshot	baseline,compact,depth,selector	0	diff	snapshot
+diff_url	compact,depth,fullPage,screenshot,selector,url1,url2,waitUntil	2	diff	url
+doctor	debug,fix,headed,offline,quick,webgpu	2	doctor
+download	path,selector	2	download
+drag	human,source,target	0	drag
+errors	clear	0	errors
+eval	script	0	eval
+fill	selector,text	0	fill
+find	action,exact,index,locator,name,text,value	0	find	role
+focus	selector	0	focus
+forward	-	0	forward
+frame_main	-	0	frame	main
+frame_switch	frame	0	frame
+get_attr	name,selector	0	get	attr
+get_box	selector	0	get	box
+get_cdp_url	-	0	get	cdp-url
+get_count	selector	0	get	count
+get_html	selector	0	get	html
+get_styles	selector	0	get	styles
+get_text	selector	0	get	text
+get_title	-	0	get	title
+get_url	-	0	get	url
+get_value	selector	0	get	value
+highlight	selector	0	highlight
+hover	selector	0	hover
+inspect	-	2	inspect
+install	withDeps	2	install
+is_checked	selector	0	is	checked
+is_enabled	selector	0	is	enabled
+is_visible	selector	0	is	visible
+keyboard_insert_text	text	0	keyboard	inserttext
+keyboard_type	text	0	keyboard	type
+keydown	key	2	keydown
+keyup	key	2	keyup
+mouse_down	button	0	mouse	down
+mouse_move	durationMs,human,seed,steps,x,y	0	mouse	move
+mouse_up	button	0	mouse	up
+mouse_wheel	dx,dy	0	mouse	wheel
+network_har_start	content	0	network	har	start
+network_har_stop	path	0	network	har	stop
+network_request	requestId	0	network	request
+network_requests	clear,filter,method,status,type	0	network	requests
+network_route	abort,allowOrigin,body,resourceType,url	0	network	route
+network_unroute	url	0	network	unroute
+open	headed,url,webgpu,webmcp	0	open
+pdf	path	0	pdf
+plugin_add	capabilities,name,noManifest,project,reference	2	plugin	add
+plugin_list	-	2	plugin	list
+plugin_run	name,payload,requestType	2	plugin	run
+plugin_show	name	2	plugin	show
+press	key	0	press
+profiler_start	categories	0	profiler	start
+profiler_stop	path	0	profiler	stop
+profiles	-	10	profiles
+pushstate	url	0	pushstate
+react_inspect	id,json	0	react	inspect
+react_renders_start	json	0	react	renders	start
+react_renders_stop	json	0	react	renders	stop
+react_suspense	json,onlyDynamic	0	react	suspense
+react_tree	json	0	react	tree
+read	filter,llms,outline,raw,readTimeoutMs,requireMd,url	0	read
+record_restart	contactSheet,contactSheetThreshold,cursor,fps,path,url	2	record	restart
+record_start	contactSheet,contactSheetThreshold,cursor,fps,path,url	2	record	start
+record_stop	-	2	record	stop
+reload	-	0	reload
+remove_init_script	id	2	removeinitscript
+screenshot	annotate,format,fullPage,ifChanged,path,quality,screenshotDir,selector,threshold	0	screenshot
+scroll	amount,direction,selector	0	scroll
+scroll_into_view	selector	0	scrollintoview
+select	selector,values	0	select
+session	-	2	session
+session_id	prefix,scope	2	session	id
+session_info	-	2	session	info
+session_list	-	2	session	list
+set_credentials	password,username	2	set	credentials
+set_device	device	0	set	device
+set_geo	latitude,longitude	0	set	geo
+set_headers	headers	2	set	headers
+set_media	colorScheme,reducedMotion	0	set	media
+set_offline	enabled	0	set	offline
+set_viewport	height,scale,width	0	set	viewport
+skills_get	all,full,names	0	skills	get
+skills_list	-	0	skills	list
+skills_path	name	0	skills	path
+snapshot	compact,delta,depth,full,includeUrls,interactive,selector	0	snapshot
+state_clean	olderThanDays	2	state	clean
+state_clear	all,name	2	state	clear
+state_list	-	2	state	list
+state_load	path	2	state	load
+state_rename	newName,oldName	2	state	rename
+state_save	path	2	state	save
+state_show	path	2	state	show
+storage_clear	storageType	0	storage	local	clear
+storage_get	key,storageType	0	storage	local
+storage_set	key,storageType,value	0	storage	local
+stream_disable	-	2	stream	disable
+stream_enable	port	2	stream	enable
+stream_status	-	2	stream	status
+swipe	amount,direction	10	swipe
+tab_close	tab	2	tab	close
+tab_list	-	0	tab	list
+tab_new	label,url	2	tab	new
+tab_switch	tab	2	tab	switch
+tap	selector	10	tap
+tools_profiles	-	10	tools	profiles
+trace_start	-	0	trace	start
+trace_stop	path	0	trace	stop
+type	clear,delayMs,selector,text	0	type
+uncheck	selector	0	uncheck
+upgrade	-	2	upgrade
+upload	files,selector	2	upload
+vitals	json,url	0	vitals
+wait_for_download	path,waitTimeoutMs	0	wait	--download
+wait_for_function	expression,waitTimeoutMs	0	wait	--fn
+wait_for_load	state,waitTimeoutMs	0	wait	--load
+wait_for_selector	selector,waitTimeoutMs	0	wait
+wait_for_text	text,waitTimeoutMs	0	wait	--text
+wait_for_url	url,waitTimeoutMs	0	wait	--url
+wait_ms	ms	0	wait
+webmcp_cancel	invocationId	2	webmcp	cancel
+webmcp_invoke	detach,frameId,params,tool,waitTimeoutMs	2	webmcp	invoke
+webmcp_list	frameId,tool	2	webmcp	list
+webmcp_result	invocationId,waitTimeoutMs	2	webmcp	result
+window_new	-	2	window	new

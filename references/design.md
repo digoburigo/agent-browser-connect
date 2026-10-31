@@ -309,6 +309,17 @@ environment override: an escape hatch named in an error message is one the agent
 take, and a bare `agent-browser` call is the single outcome this skill exists to prevent.
 The recovery for exit 10 is to report it and add a line to `scripts/guard.sh`.
 
+A dash word is a flag unless the verb is in `AB_VERB_NEGATIVE_NUMBERS` and the word is a
+plain negative number, so `set geo -23.5 -46.6` and `fill @e1 -5` work. The list is per
+verb because the native parsers differ: `scroll down -5` drops the amount and scrolls the
+default distance, so it stays refused. Other dash words stay refused on every verb because
+the CLI strips global flags such as `-q` even from a `fill` value.
+
+`tests/mcp-catalog.tsv` classifies every tool in `agent-browser mcp --tools all`.
+`node tests/mcp-catalog.mjs --live` reports new tools and input properties after a version
+bump, so most gaps surface before a task hits exit 10. It covers what MCP exposes, not
+every CLI flag, and a new input can still need a guard row of its own.
+
 `AB_DENY_EXPLAIN` in that file supplies the specific reason for a refusal. It is advisory
 only — it grants nothing, so an entry that goes stale degrades a message and never opens a
 hole. Presence in it is also what selects exit 2 over exit 10.

@@ -343,6 +343,21 @@ printf '[]' | "$AB" batch --json > "$TEMP_ROOT/empty-outer-batch.json"
 echo 'Observed actual JSON batch input value="" after nonempty text; native empty outer array accepted'
 pass "JSON batch clears an actual input with an empty string"
 
+"$AB" fill '#batch-input' -5 >/dev/null
+assert_eq "$("$AB" get value '#batch-input')" '-5'
+printf '%s\n' '[["fill","#batch-input","-7.5"]]' | "$AB" batch --bail >/dev/null
+assert_eq "$("$AB" get value '#batch-input')" '-7.5'
+"$AB" fill '#batch-input' '' >/dev/null
+"$AB" type '#batch-input' -5 >/dev/null
+assert_eq "$("$AB" get value '#batch-input')" '-5'
+"$AB" eval 'window.addEventListener("wheel", event => { window.__wheelDeltaY = event.deltaY; }); 1' >/dev/null
+"$AB" mouse move 5 10 >/dev/null
+"$AB" mouse wheel -100 >/dev/null
+assert_eq "$("$AB" eval 'window.__wheelDeltaY')" '-100'
+"$AB" mouse move -5 10 >/dev/null
+"$AB" set geo -23.5 -46.6 >/dev/null
+pass "negative numbers reach the native CLI as values"
+
 
 ab_configure_policy "$WRAPPER_ROOT/$SESSION/session.meta"
 ab_session_info "$(command -v agent-browser)" "$(command -v node)" "$JSON" "$SESSION"
